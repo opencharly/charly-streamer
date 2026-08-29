@@ -7,6 +7,7 @@
 
 pub mod display;
 pub mod input;
+pub mod pipeline;
 pub mod rank;
 
 /// Initialise GStreamer and promote hardware encoders in the correct order.
