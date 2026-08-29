@@ -81,7 +81,8 @@ pub fn build_capture(render_node: &str, geom: Geometry, sink: gst::Element) -> R
     pipeline
         .add_many([&source, &size, &convert, &sink])
         .context("adding elements")?;
-    gst::Element::link_many([&source, &size, &convert, &sink]).context("linking the capture chain")?;
+    gst::Element::link_many([&source, &size, &convert, &sink])
+        .context("linking the capture chain")?;
 
     Ok(Capture {
         pipeline,
