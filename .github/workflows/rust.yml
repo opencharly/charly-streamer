@@ -3,7 +3,7 @@
 # This repo is PRODUCT CODE, not a candy — it ships no charly.yml, so the candy
 # manifest gate that the layer/pod repos run does not apply here and was removed
 # rather than left to fail on a file that will never exist.
-name: rust
+name: build & test
 
 on:
   push:
@@ -39,6 +39,12 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      - name: Go build and test (CGO_ENABLED=0)
+        run: |
+          CGO_ENABLED=0 go build ./...
+          CGO_ENABLED=0 go test ./...
+          go vet ./...
 
       - name: Test
         # The ranking test needs a GStreamer registry; it skips itself when the
