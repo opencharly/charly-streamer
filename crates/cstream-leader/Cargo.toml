@@ -9,6 +9,7 @@ description = "Per-user session leader: PAM authentication, then an irreversible
 [dependencies]
 anyhow.workspace = true
 libc = "0.2"
+pam-client = "0.5"
 
 [dev-dependencies]
 libc = "0.2"
