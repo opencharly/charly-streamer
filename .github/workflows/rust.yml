@@ -1,0 +1,46 @@
+# Gate the streamer: build, test, clippy and fmt.
+#
+# This repo is PRODUCT CODE, not a candy — it ships no charly.yml, so the candy
+# manifest gate that the layer/pod repos run does not apply here and was removed
+# rather than left to fail on a file that will never exist.
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GStreamer development headers
+        # gstreamer-rs binds against the system GStreamer; without -dev the build
+        # fails in pkg-config rather than in our code.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        # The ranking test needs a GStreamer registry; it skips itself when the
+        # runner has no VA-API encoder, which is the normal case on CI hardware.
+        run: cargo test --workspace
