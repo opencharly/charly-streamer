@@ -16,14 +16,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: GStreamer development headers
+      - name: Native build dependencies
         # gstreamer-rs binds against the system GStreamer; without -dev the build
         # fails in pkg-config rather than in our code.
+        #
+        # libpam0g-dev + libclang-dev are the leader's: pam-sys generates its
+        # bindings with bindgen at build time, so it needs BOTH the PAM headers and
+        # a libclang to parse them. A runner missing libclang fails in clang-sys's
+        # build script ("couldn't find any valid shared libraries matching
+        # ['libclang.so']") long before any of this repo's code is compiled, which
+        # names the wrong layer entirely.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base pkg-config
+            gstreamer1.0-plugins-base pkg-config \
+            libpam0g-dev libclang-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
