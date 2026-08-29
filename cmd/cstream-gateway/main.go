@@ -54,12 +54,32 @@ func page(s Status) string {
 	if s.Ready {
 		state = "CSTREAM-READY"
 	}
+	// The input targets below exist so an input probe can be NON-VACUOUS. A click
+	// or a keystroke that lands on an inert page cannot be distinguished from one
+	// that was silently dropped -- both "succeed". These elements record what
+	// actually arrived, so a CDP probe can assert the effect rather than the
+	// absence of an error.
 	return fmt.Sprintf(`<!doctype html>
 <title>cstream</title>
 <h1>cstream</h1>
 <p id="state">%s</p>
 <p id="render-node">%s</p>
 <p id="display">%s</p>
+
+<button id="probe-button" onclick="document.getElementById('click-result').textContent='CLICK-RECEIVED'">probe</button>
+<p id="click-result">no-click</p>
+
+<input id="probe-input" oninput="document.getElementById('type-result').textContent='TYPED:'+this.value">
+<p id="type-result">no-input</p>
+
+<p id="key-result">no-key</p>
+<script>
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') {
+    document.getElementById('key-result').textContent = 'KEY-RECEIVED:Escape';
+  }
+});
+</script>
 `, state, s.RenderNode, s.Display)
 }
 

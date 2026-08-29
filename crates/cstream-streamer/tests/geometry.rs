@@ -9,7 +9,12 @@ use cstream_streamer::pipeline::Geometry;
 
 #[test]
 fn odd_sizes_round_to_eight() {
-    let g = Geometry { width: 1919, height: 1079, framerate: 60 }.sanitised();
+    let g = Geometry {
+        width: 1919,
+        height: 1079,
+        framerate: 60,
+    }
+    .sanitised();
     assert_eq!(g.width % 8, 0, "width must round to 8: {}", g.width);
     assert_eq!(g.height % 8, 0, "height must round to 8: {}", g.height);
     assert_eq!((g.width, g.height), (1912, 1072));
@@ -17,10 +22,20 @@ fn odd_sizes_round_to_eight() {
 
 #[test]
 fn sizes_clamp_to_the_supported_range() {
-    let small = Geometry { width: 1, height: 1, framerate: 60 }.sanitised();
+    let small = Geometry {
+        width: 1,
+        height: 1,
+        framerate: 60,
+    }
+    .sanitised();
     assert_eq!((small.width, small.height), (640, 480));
 
-    let huge = Geometry { width: 99999, height: 99999, framerate: 1000 }.sanitised();
+    let huge = Geometry {
+        width: 99999,
+        height: 99999,
+        framerate: 1000,
+    }
+    .sanitised();
     assert_eq!((huge.width, huge.height), (3840, 2160));
     assert_eq!(huge.framerate, 240);
 }
