@@ -120,3 +120,60 @@ pub fn session_env(user: &str) -> Vec<(String, String)> {
         ("USER".into(), user.into()),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// PAM authentication.
+// ---------------------------------------------------------------------------
+
+use pam_client::conv_mock::Conversation;
+use pam_client::{Context, Flag};
+
+/// Authenticate `user` with `password` and open a PAM session.
+///
+/// The call ORDER is the contract, and each step is separately fallible:
+///
+///   authenticate  proves the credential
+///   acct_mgmt     proves the account is allowed to log in AT ALL -- expired,
+///                 locked and disabled accounts authenticate successfully and are
+///                 rejected only here, so skipping it lets a disabled user in
+///   putenv        the session class, BEFORE open_session; logind reads it when the
+///                 session is created and a later change has no effect
+///   open_session  registers the session with logind
+///
+/// Returns the PAM context so the caller can close the session on logout; dropping
+/// it early tears the session down.
+pub fn authenticate_and_open(
+    service: &str,
+    user: &str,
+    password: &str,
+) -> Result<Context<Conversation>> {
+    let mut ctx = Context::new(
+        service,
+        Some(user),
+        Conversation::with_credentials(user, password),
+    )
+    .map_err(|e| anyhow::anyhow!("PAM context for service {service:?}: {e}"))?;
+
+    ctx.authenticate(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("authentication failed for {user:?}: {e}"))?;
+
+    // NOT optional. A locked or expired account authenticates fine and is refused
+    // only by account management, so omitting this admits disabled users.
+    ctx.acct_mgmt(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("account management refused {user:?}: {e}"))?;
+
+    for (k, v) in session_env(user) {
+        ctx.putenv(format!("{k}={v}").as_str())
+            .map_err(|e| anyhow::anyhow!("putenv {k}: {e}"))?;
+    }
+
+    // The Session guard must be kept alive: dropping it closes the session
+    // immediately, so a leader that discards it opens and tears down in one step
+    // and logind never sees a live session.
+    let session = ctx
+        .open_session(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("opening a session for {user:?}: {e}"))?;
+    std::mem::forget(session);
+
+    Ok(ctx)
+}
