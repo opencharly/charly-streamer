@@ -1,0 +1,21 @@
+[package]
+name = "cstream-streamer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cstream Wayland streamer: gst-wayland-display source, VA-API encode, WebRTC transport"
+
+[dependencies]
+gst.workspace = true
+gst-video.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[lib]
+name = "cstream_streamer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cstream-streamer"
+path = "src/main.rs"

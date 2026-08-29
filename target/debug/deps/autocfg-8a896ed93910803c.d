@@ -1,0 +1,10 @@
+/tmp/claude-1000/-home-atrawog-Sync-Atrapub-coder-claude-opencharly/00b30ad5-20c7-4e7d-bab1-53c7d5d7fee0/scratchpad/cstreamer/target/debug/deps/autocfg-8a896ed93910803c.d: /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/tmp/claude-1000/-home-atrawog-Sync-Atrapub-coder-claude-opencharly/00b30ad5-20c7-4e7d-bab1-53c7d5d7fee0/scratchpad/cstreamer/target/debug/deps/libautocfg-8a896ed93910803c.rlib: /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/tmp/claude-1000/-home-atrawog-Sync-Atrapub-coder-claude-opencharly/00b30ad5-20c7-4e7d-bab1-53c7d5d7fee0/scratchpad/cstreamer/target/debug/deps/libautocfg-8a896ed93910803c.rmeta: /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs:
+/home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs:
+/home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs:
+/home/atrawog/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs:

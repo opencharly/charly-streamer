@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/cstream-streamer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/opencharly/charly-streamer"
+
+[workspace.dependencies]
+gst = { package = "gstreamer", version = "0.23" }
+gst-video = { package = "gstreamer-video", version = "0.23" }
+anyhow = "1"
+tracing = "0.1"
