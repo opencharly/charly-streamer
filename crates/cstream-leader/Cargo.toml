@@ -1,0 +1,18 @@
+[package]
+name = "cstream-leader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-user session leader: PAM authentication, then an irreversible privilege drop"
+
+[dependencies]
+anyhow.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[lib]
+name = "cstream_leader"
+path = "src/lib.rs"
