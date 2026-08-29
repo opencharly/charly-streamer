@@ -1,0 +1,4 @@
+# Rust build artifacts (committed once in feat/gateway — removed 2026-08-29)
+/target/
+# Compiled gateway binary (built from cmd/cstream-gateway)
+/cstream-gateway
