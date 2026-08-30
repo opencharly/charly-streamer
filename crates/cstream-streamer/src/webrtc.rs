@@ -80,6 +80,19 @@ pub fn registry_has(name: &str) -> bool {
     gst::ElementFactory::find(name).is_some()
 }
 
+/// The port the in-process signalling server listens on.
+///
+/// Overridable because a second streamer on the same host would otherwise collide on
+/// the element's default (8443) and fail to bind -- which is precisely the
+/// multi-session case this component exists for.
+pub fn signalling_port() -> u32 {
+    std::env::var("CSTREAM_SIGNALLING_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|p| (1..=65535).contains(p))
+        .unwrap_or(8443)
+}
+
 /// Build the webrtcsink that carries the encoded stream.
 ///
 /// Two details are load-bearing and neither is obvious from the property list:
@@ -96,6 +109,20 @@ pub fn make_sink(encoder: &Encoder) -> Result<gst::Element> {
         .context("creating webrtcsink — is gst-plugin-rswebrtc installed?")?;
 
     sink.set_property("video-caps", gst::Caps::builder("video/x-h264").build());
+
+    // Run the signalling server in-process. Not a convenience: webrtcsink's default
+    // signaller DIALS ws://127.0.0.1:8443, and with nothing listening it posts a
+    // stream error onto the bus moments after the pipeline reaches PLAYING.
+    // Measured -- the graph builds, the encoder opens, both markers print, and then:
+    //
+    //   Error: pipeline error from GstWebRTCSink:webrtcsink0:
+    //          GStreamer encountered a general stream error.
+    //
+    // So without this the streamer cannot serve at all, and the failure arrives AFTER
+    // every "it works" signal, which is the worst place for one. `false` is the
+    // element's own default, so it has to be set explicitly.
+    sink.set_property("run-signalling-server", true);
+    sink.set_property("signalling-server-port", signalling_port());
 
     let want = encoder.clone();
     sink.connect("encoder-setup", false, move |values| {
