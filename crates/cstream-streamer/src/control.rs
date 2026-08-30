@@ -268,6 +268,75 @@ mod tests {
         assert_eq!((g.width, g.height), (1600, 896));
     }
 
+    // The tests above cover resize/dispatch. These cover the SERVER halves --
+    // bind, serve, handle -- which are the paths a resize actually arrives over.
+    // Without them the module could pass its whole suite while no client could
+    // ever reach it.
+    #[test]
+    fn a_client_can_bind_connect_and_get_a_reply_over_the_real_socket() {
+        use std::io::{BufRead, BufReader, Write};
+
+        gst::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("cstream-ctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ctl.sock");
+        let path_s = path.to_str().unwrap().to_string();
+
+        let (c, _size) = fixture();
+        let listener = bind(&path_s).expect("bind the control socket");
+        let ctl = Arc::new(Mutex::new(c));
+        std::thread::spawn(move || serve(listener, ctl));
+
+        let stream = UnixStream::connect(&path_s).expect("connect to the control socket");
+        let mut out = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+
+        writeln!(out, "resize 1600 900").unwrap();
+        out.flush().unwrap();
+        let mut reply = String::new();
+        reader.read_line(&mut reply).unwrap();
+        assert_eq!(
+            reply.trim(),
+            "OK resize 1600x896",
+            "the reply must name what APPLIED"
+        );
+
+        // A second command on the SAME connection: `handle` loops over lines, so a
+        // client must not have to reconnect per command.
+        writeln!(out, "geometry").unwrap();
+        out.flush().unwrap();
+        let mut reply2 = String::new();
+        reader.read_line(&mut reply2).unwrap();
+        assert_eq!(reply2.trim(), "OK geometry 1600x896@60");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A leftover socket from a crashed run makes bind fail with EADDRINUSE, which
+    // reads as "already running" when nothing is. bind() removes it; this proves so.
+    #[test]
+    fn bind_replaces_a_stale_socket_file() {
+        let dir = std::env::temp_dir().join(format!("cstream-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ctl.sock");
+        let path_s = path.to_str().unwrap().to_string();
+
+        let first = bind(&path_s).expect("first bind");
+        drop(first); // the socket FILE outlives the listener
+        assert!(path.exists(), "a stale socket file is left behind");
+
+        bind(&path_s).expect("bind must replace a stale socket rather than fail EADDRINUSE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn socket_path_is_overridable_so_a_second_instance_does_not_collide() {
+        std::env::set_var("CSTREAM_CONTROL_SOCKET", "/tmp/cstream-test-override.sock");
+        assert_eq!(socket_path(), "/tmp/cstream-test-override.sock");
+        std::env::remove_var("CSTREAM_CONTROL_SOCKET");
+        assert_eq!(socket_path(), "/tmp/cstream-control.sock");
+    }
+
     #[test]
     fn the_reply_names_what_applied_not_what_was_asked() {
         gst::init().unwrap();
