@@ -1,14 +1,16 @@
 //! cstream-streamer — the Wayland streamer.
 //!
-//! Three modules carry the parts that are easy to get subtly wrong:
+//! Four modules carry the parts that are easy to get subtly wrong:
 //!   * `rank`    — encoder promotion, which must happen before the first webrtcsink
 //!   * `display` — the gst-wayland-display source, created from the registry
 //!   * `input`   — event field types GWD `.expect()`s exactly
+//!   * `webrtc`  — which encoder actually carries the stream, and saying so out loud
 
 pub mod display;
 pub mod input;
 pub mod pipeline;
 pub mod rank;
+pub mod webrtc;
 
 /// Initialise GStreamer and promote hardware encoders in the correct order.
 ///
