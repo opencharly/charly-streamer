@@ -40,9 +40,20 @@ fn main() -> Result<()> {
 
     let probe = std::env::args().any(|a| a == "--probe");
 
+    // CSTREAM_FRAME_DIR turns on the frame tap. It is how this process takes over
+    // what a separate parent pipeline used to do: `waylanddisplaysrc` creates a
+    // compositor and holds the render node, so nothing else can observe this
+    // display. The desktop nests into THIS one and any frame-content gate reads
+    // THIS tap.
+    let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
     let sink = webrtc::make_sink(&encoder)?;
-    let capture = build_capture(&render_node, Geometry::default(), sink)
-        .context("building the capture-to-webrtcsink graph")?;
+    let capture = build_capture(
+        &render_node,
+        Geometry::default(),
+        sink,
+        frame_dir.as_deref(),
+    )
+    .context("building the capture-to-webrtcsink graph")?;
 
     capture
         .pipeline
@@ -58,6 +69,9 @@ fn main() -> Result<()> {
     // The marker is what the bed asserts. It is printed only after the pipeline is
     // ACTUALLY playing, so it cannot be produced by a graph that merely built.
     println!("CSTREAM-PIPELINE-PLAYING encoder={}", encoder.label());
+    if let Some(dir) = frame_dir.as_deref() {
+        println!("CSTREAM-FRAME-TAP dir={dir}");
+    }
 
     // And that the chosen encoder OPENS, not merely that it is registered. Without
     // this the marker above would pass on a host whose VA plugin loads over an
