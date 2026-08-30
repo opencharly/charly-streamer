@@ -6,6 +6,7 @@
 //!   * `input`   — event field types GWD `.expect()`s exactly
 //!   * `webrtc`  — which encoder actually carries the stream, and saying so out loud
 
+pub mod control;
 pub mod display;
 pub mod input;
 pub mod pipeline;
