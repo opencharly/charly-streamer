@@ -45,6 +45,13 @@ fn main() -> Result<()> {
     // compositor and holds the render node, so nothing else can observe this
     // display. The desktop nests into THIS one and any frame-content gate reads
     // THIS tap.
+    // The compositor cannot create its socket without this, and its failure to do
+    // so surfaces as an opaque panic inside the element rather than as a missing
+    // directory. See display::prepare_runtime_dir.
+    let runtime_dir = env_or("XDG_RUNTIME_DIR", "/tmp/cstream-rt");
+    cstream_streamer::display::prepare_runtime_dir(&runtime_dir)?;
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+
     let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
     let sink = webrtc::make_sink(&encoder)?;
     let capture = build_capture(
