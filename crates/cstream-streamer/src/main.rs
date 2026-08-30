@@ -40,14 +40,62 @@ fn main() -> Result<()> {
 
     let probe = std::env::args().any(|a| a == "--probe");
 
-    let sink = webrtc::make_sink(&encoder)?;
-    let capture = build_capture(&render_node, Geometry::default(), sink)
-        .context("building the capture-to-webrtcsink graph")?;
+    // CSTREAM_FRAME_DIR turns on the frame tap. It is how this process takes over
+    // what a separate parent pipeline used to do: `waylanddisplaysrc` creates a
+    // compositor and holds the render node, so nothing else can observe this
+    // display. The desktop nests into THIS one and any frame-content gate reads
+    // THIS tap.
+    // The compositor cannot create its socket without this, and its failure to do
+    // so surfaces as an opaque panic inside the element rather than as a missing
+    // directory. See display::prepare_runtime_dir.
+    let runtime_dir = env_or("XDG_RUNTIME_DIR", "/tmp/cstream-rt");
+    cstream_streamer::display::prepare_runtime_dir(&runtime_dir)?;
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
 
-    capture
-        .pipeline
-        .set_state(gst::State::Playing)
-        .context("bringing the pipeline to PLAYING")?;
+    let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
+    let sink = webrtc::make_sink(&encoder)?;
+    let capture = build_capture(
+        &render_node,
+        Geometry::default(),
+        sink,
+        frame_dir.as_deref(),
+    )
+    .context("building the capture-to-webrtcsink graph")?;
+
+    if let Err(e) = capture.pipeline.set_state(gst::State::Playing) {
+        // set_state returns a bare StateChangeError that names nothing. The reason
+        // is on the BUS, and without draining it the operator gets "bringing the
+        // pipeline to PLAYING" and no way to tell a missing element from a caps
+        // negotiation failure from a busy render node. Measured: that bare message
+        // cost a debugging cycle.
+        let detail = capture
+            .pipeline
+            .bus()
+            .map(|bus| {
+                let mut msgs = Vec::new();
+                while let Some(m) = bus.pop() {
+                    if let gst::MessageView::Error(err) = m.view() {
+                        msgs.push(format!(
+                            "{}: {}{}",
+                            err.src()
+                                .map(|s| s.path_string().to_string())
+                                .unwrap_or_default(),
+                            err.error(),
+                            err.debug().map(|d| format!(" [{d}]")).unwrap_or_default()
+                        ));
+                    }
+                }
+                msgs.join("; ")
+            })
+            .unwrap_or_default();
+        let _ = capture.pipeline.set_state(gst::State::Null);
+        if detail.is_empty() {
+            return Err(anyhow::anyhow!("bringing the pipeline to PLAYING: {e}"));
+        }
+        return Err(anyhow::anyhow!(
+            "bringing the pipeline to PLAYING: {detail}"
+        ));
+    }
 
     let (change, state, _) = capture.pipeline.state(STATE_TIMEOUT);
     change.context("the pipeline never settled into a state")?;
@@ -58,6 +106,9 @@ fn main() -> Result<()> {
     // The marker is what the bed asserts. It is printed only after the pipeline is
     // ACTUALLY playing, so it cannot be produced by a graph that merely built.
     println!("CSTREAM-PIPELINE-PLAYING encoder={}", encoder.label());
+    if let Some(dir) = frame_dir.as_deref() {
+        println!("CSTREAM-FRAME-TAP dir={dir}");
+    }
 
     // And that the chosen encoder OPENS, not merely that it is registered. Without
     // this the marker above would pass on a host whose VA plugin loads over an
