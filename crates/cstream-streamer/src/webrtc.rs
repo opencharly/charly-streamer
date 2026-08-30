@@ -133,6 +133,35 @@ fn tune_encoder(enc: &gst::Element, want: &Encoder) {
     }
 }
 
+/// Prove a chosen hardware encoder can actually OPEN on this host.
+///
+/// Registration is not capability. A VA element is registered whenever the plugin
+/// loads, which happens on a machine with no usable render node at all -- so
+/// `select_encoder` returning `Hardware` means "the element exists", and nothing
+/// more. Bringing it to READY is what makes it open the driver, and it is the
+/// cheapest check that distinguishes a working hardware path from a registry entry.
+///
+/// Software is trivially ready; only the hardware claim needs proving.
+pub fn verify_openable(encoder: &Encoder) -> Result<()> {
+    let Encoder::Hardware(name) = encoder else {
+        return Ok(());
+    };
+    let enc = gst::ElementFactory::make(name)
+        .build()
+        .with_context(|| format!("creating {name}"))?;
+    let outcome = enc.set_state(gst::State::Ready);
+    // NULL first, whatever happened: an element left in READY holds the render node
+    // open, and the next probe in the same container then fails for the wrong reason.
+    let _ = enc.set_state(gst::State::Null);
+    outcome.with_context(|| {
+        format!(
+            "{name} is registered but will not open on this render node -- the plugin loads \
+                 even where the hardware is unusable, so a registry lookup alone proves nothing"
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

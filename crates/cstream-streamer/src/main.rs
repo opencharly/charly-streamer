@@ -59,6 +59,12 @@ fn main() -> Result<()> {
     // ACTUALLY playing, so it cannot be produced by a graph that merely built.
     println!("CSTREAM-PIPELINE-PLAYING encoder={}", encoder.label());
 
+    // And that the chosen encoder OPENS, not merely that it is registered. Without
+    // this the marker above would pass on a host whose VA plugin loads over an
+    // unusable render node -- exactly the case `encode: va` exists to catch.
+    webrtc::verify_openable(&encoder)?;
+    println!("CSTREAM-ENCODER-OPENABLE encoder={}", encoder.label());
+
     if probe {
         capture.pipeline.set_state(gst::State::Null).ok();
         return Ok(());
