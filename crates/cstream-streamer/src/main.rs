@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
+use cstream_streamer::control::{self, Control};
 use cstream_streamer::pipeline::{build_capture, Geometry};
 use cstream_streamer::webrtc::{self, EncodePolicy};
 
@@ -119,6 +120,33 @@ fn main() -> Result<()> {
     if probe {
         capture.pipeline.set_state(gst::State::Null).ok();
         return Ok(());
+    }
+
+    // The control socket is opened only on the SERVING path, after the pipeline is
+    // actually PLAYING. Opening it earlier would advertise a control surface for a
+    // graph that may still fail to negotiate, and `--probe` must not leave a socket
+    // behind for the next run to trip over.
+    //
+    // It runs on its own thread: the bus loop below blocks with no timeout, so
+    // anything sharing that thread would never be served.
+    let ctl_path = control::socket_path();
+    match control::bind(&ctl_path) {
+        Ok(listener) => {
+            let ctl = std::sync::Arc::new(std::sync::Mutex::new(Control::new(
+                capture.size.clone(),
+                Geometry::default(),
+            )));
+            std::thread::spawn(move || control::serve(listener, ctl));
+            // Asserted by the bed: a resize gate that cannot reach the socket should
+            // fail on the socket, not time out looking like a broken compositor.
+            println!("CSTREAM-CONTROL-LISTENING socket={ctl_path}");
+        }
+        Err(e) => {
+            // Not fatal: a stream that cannot be resized is still a stream, and
+            // killing the session over the control channel would be worse than
+            // losing it. It is reported loudly so the bed's gate fails with a cause.
+            eprintln!("cstream-streamer: control socket unavailable: {e:#}");
+        }
     }
 
     // Serve until the bus reports EOS or an error. `iter_timed` with no timeout
