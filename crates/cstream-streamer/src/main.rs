@@ -55,10 +55,40 @@ fn main() -> Result<()> {
     )
     .context("building the capture-to-webrtcsink graph")?;
 
-    capture
-        .pipeline
-        .set_state(gst::State::Playing)
-        .context("bringing the pipeline to PLAYING")?;
+    if let Err(e) = capture.pipeline.set_state(gst::State::Playing) {
+        // set_state returns a bare StateChangeError that names nothing. The reason
+        // is on the BUS, and without draining it the operator gets "bringing the
+        // pipeline to PLAYING" and no way to tell a missing element from a caps
+        // negotiation failure from a busy render node. Measured: that bare message
+        // cost a debugging cycle.
+        let detail = capture
+            .pipeline
+            .bus()
+            .map(|bus| {
+                let mut msgs = Vec::new();
+                while let Some(m) = bus.pop() {
+                    if let gst::MessageView::Error(err) = m.view() {
+                        msgs.push(format!(
+                            "{}: {}{}",
+                            err.src()
+                                .map(|s| s.path_string().to_string())
+                                .unwrap_or_default(),
+                            err.error(),
+                            err.debug().map(|d| format!(" [{d}]")).unwrap_or_default()
+                        ));
+                    }
+                }
+                msgs.join("; ")
+            })
+            .unwrap_or_default();
+        let _ = capture.pipeline.set_state(gst::State::Null);
+        if detail.is_empty() {
+            return Err(anyhow::anyhow!("bringing the pipeline to PLAYING: {e}"));
+        }
+        return Err(anyhow::anyhow!(
+            "bringing the pipeline to PLAYING: {detail}"
+        ));
+    }
 
     let (change, state, _) = capture.pipeline.state(STATE_TIMEOUT);
     change.context("the pipeline never settled into a state")?;
