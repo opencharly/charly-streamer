@@ -55,6 +55,9 @@ fn main() -> Result<()> {
 
     let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
     let sink = webrtc::make_sink(&encoder)?;
+    // Clone before handing the sink to build_capture, which takes it by value. A gst::Element
+    // is a refcounted GObject handle, so this is the SAME element, not a second sink.
+    let audio_sink = sink.clone();
     let capture = build_capture(
         &render_node,
         Geometry::default(),
@@ -62,6 +65,20 @@ fn main() -> Result<()> {
         frame_dir.as_deref(),
     )
     .context("building the capture-to-webrtcsink graph")?;
+
+    // Audio is attached AFTER the video graph exists, onto the same sink, so a failure here
+    // names the audio branch instead of surfacing as an opaque failure to build "the graph".
+    match cstream_streamer::audio::AudioConfig::from_env() {
+        Some(cfg) => {
+            cstream_streamer::audio::attach(&capture.pipeline, &audio_sink, &cfg)
+                .context("attaching the audio branch")?;
+            println!(
+                "audio: capturing {} (capture_sink={})",
+                cfg.target, cfg.capture_sink
+            );
+        }
+        None => println!("audio: disabled by CSTREAM_AUDIO=off"),
+    }
 
     if let Err(e) = capture.pipeline.set_state(gst::State::Playing) {
         // set_state returns a bare StateChangeError that names nothing. The reason
