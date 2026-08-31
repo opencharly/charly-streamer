@@ -6,11 +6,13 @@
 //!   * `input`   — event field types GWD `.expect()`s exactly
 //!   * `webrtc`  — which encoder actually carries the stream, and saying so out loud
 //!   * `audio`   — monitor capture, which connects and stays SILENT if misconfigured
+//!   * `lifecycle` — locking the desktop once the last viewer is gone
 
 pub mod audio;
 pub mod control;
 pub mod display;
 pub mod input;
+pub mod lifecycle;
 pub mod pipeline;
 pub mod rank;
 pub mod webrtc;

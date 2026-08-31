@@ -80,6 +80,20 @@ fn main() -> Result<()> {
         None => println!("audio: off (opt in with CSTREAM_AUDIO=on or a target node name)"),
     }
 
+    // WP5 lock/idle. Armed on the same sink, whose consumer-added/consumer-removed signals
+    // are the only place this process learns that somebody is (or is no longer) watching.
+    match cstream_streamer::lifecycle::LockPolicy::from_env() {
+        Some(policy) => {
+            let secs = policy.after.as_secs();
+            cstream_streamer::lifecycle::arm(&audio_sink, policy, runtime_dir.clone());
+            println!(
+                "lock: {} after {secs}s with no viewer",
+                cstream_streamer::lifecycle::LOCK_COMMAND
+            );
+        }
+        None => println!("lock: off (set CSTREAM_LOCK_AFTER=<seconds> to arm)"),
+    }
+
     if let Err(e) = capture.pipeline.set_state(gst::State::Playing) {
         // set_state returns a bare StateChangeError that names nothing. The reason
         // is on the BUS, and without draining it the operator gets "bringing the
