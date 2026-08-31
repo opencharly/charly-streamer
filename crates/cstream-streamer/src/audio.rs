@@ -103,6 +103,34 @@ impl AudioConfig {
         }
         b.build()
     }
+
+    /// The caps `pipewiresrc` must negotiate, placed UPSTREAM of `audioconvert`.
+    ///
+    /// Two separate things depend on this, and both were measured on a live pod.
+    ///
+    /// **`audio/x-raw` at all.** `pipewiresrc` serves audio *and* video. Against a
+    /// caps-agnostic peer it negotiates **video**, finds no video node, and reports
+    /// `stream error: target not found` — a message that reads like "your node is missing"
+    /// and is in fact "no *video* target". Naming the media type removes the ambiguity.
+    ///
+    /// **`channels=2` when capturing a sink's monitor.** Without it the stream negotiated a
+    /// single `input_MONO` port and PipeWire linked it to `monitor_FL` **only** — the right
+    /// channel was not mixed down, it was dropped. Desktop audio came out left-channel-only,
+    /// while every check still passed, because a link existed and audio flowed.
+    ///
+    /// The constraint has to sit upstream of `audioconvert`: downstream of it, conversion
+    /// simply satisfies the request and `pipewiresrc` still takes one channel.
+    ///
+    /// Only for a sink monitor. A real source may legitimately be mono — `cstream-mic` is —
+    /// and demanding two channels there would fail negotiation for no reason.
+    pub fn caps(&self) -> gst::Caps {
+        let b = gst::Caps::builder("audio/x-raw");
+        if self.capture_sink {
+            b.field("channels", 2i32).build()
+        } else {
+            b.build()
+        }
+    }
 }
 
 /// Add `pipewiresrc ! queue ! audioconvert ! audioresample` to `pipeline` and link it into `sink`.
@@ -115,6 +143,14 @@ pub fn attach(pipeline: &gst::Pipeline, sink: &gst::Element, cfg: &AudioConfig) 
         .property("stream-properties", cfg.stream_properties())
         .build()
         .context("creating pipewiresrc — is gst-plugin-pipewire installed?")?;
+
+    // Immediately after the source and BEFORE the queue: see AudioConfig::caps. This is what
+    // makes pipewiresrc negotiate audio rather than video, and stereo rather than one channel.
+    let caps = gst::ElementFactory::make("capsfilter")
+        .name("audio-caps")
+        .property("caps", cfg.caps())
+        .build()
+        .context("creating the audio capsfilter")?;
 
     // A queue between capture and the sink. The video branch takes the same precaution at its
     // tee: without it, back-pressure from one branch stalls the other, and an audio stall on a
@@ -132,9 +168,9 @@ pub fn attach(pipeline: &gst::Pipeline, sink: &gst::Element, cfg: &AudioConfig) 
         .context("creating audioresample")?;
 
     pipeline
-        .add_many([&src, &queue, &convert, &resample])
+        .add_many([&src, &caps, &queue, &convert, &resample])
         .context("adding the audio elements")?;
-    gst::Element::link_many([&src, &queue, &convert, &resample])
+    gst::Element::link_many([&src, &caps, &queue, &convert, &resample])
         .context("linking the audio chain")?;
 
     // Link into the sink LAST, and by element rather than by a hardcoded pad name:
@@ -219,6 +255,51 @@ mod tests {
     /// process when the path is unavailable, and the process is the Wayland parent, so a
     /// default of "on" costs the whole desktop wherever audio is not reachable yet.
     #[test]
+    fn a_sink_monitor_is_captured_in_stereo() {
+        let _ = gst::init();
+        let c = AudioConfig::default();
+        assert_eq!(
+            c.caps().structure(0).unwrap().get::<i32>("channels").ok(),
+            Some(2),
+            "without channels=2 the stream negotiates one input_MONO port and PipeWire links \
+             monitor_FL ONLY — the right channel is dropped, not mixed"
+        );
+    }
+
+    #[test]
+    fn a_real_source_is_not_forced_to_stereo() {
+        let _ = gst::init();
+        // cstream-mic is legitimately MONO. Demanding two channels there would fail
+        // negotiation for no reason, so the constraint is tied to monitor capture.
+        let c = AudioConfig {
+            target: MIC_NODE.into(),
+            capture_sink: false,
+        };
+        assert!(c
+            .caps()
+            .structure(0)
+            .unwrap()
+            .get::<i32>("channels")
+            .is_err());
+    }
+
+    #[test]
+    fn the_caps_always_name_the_media_type() {
+        let _ = gst::init();
+        // pipewiresrc serves audio AND video. Against a caps-agnostic peer it negotiates
+        // VIDEO and reports `target not found` — which reads as "node missing" and is not.
+        for c in [
+            AudioConfig::default(),
+            AudioConfig {
+                target: MIC_NODE.into(),
+                capture_sink: false,
+            },
+        ] {
+            assert_eq!(c.caps().structure(0).unwrap().name(), "audio/x-raw");
+        }
+    }
+
+    #[test]
     fn audio_is_off_unless_asked_for() {
         assert_eq!(with_env(None, AudioConfig::from_env), None);
         assert_eq!(with_env(Some(""), AudioConfig::from_env), None);
@@ -248,6 +329,30 @@ mod tests {
         pipeline.add(&sink).unwrap();
 
         attach(&pipeline, &sink, &AudioConfig::default()).expect("the audio chain must link");
+
+        // The capsfilter must be IN the pipeline and actually LINKED downstream of the source.
+        // Building an element and forgetting to add/link it compiles, runs, and silently does
+        // nothing — I did exactly that while writing this, and every other assertion here still
+        // passed. So assert the wiring, not just the construction.
+        let capsf = pipeline
+            .by_name("audio-caps")
+            .expect("the audio capsfilter must be added to the pipeline");
+        let peer = capsf
+            .static_pad("sink")
+            .and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+            .expect("the capsfilter must be linked to something upstream");
+        assert_eq!(
+            peer.factory().map(|f| f.name()).as_deref(),
+            Some("pipewiresrc"),
+            "the caps must constrain pipewiresrc directly — downstream of audioconvert the \
+             conversion satisfies them and the source still negotiates one channel"
+        );
+        let want: gst::Caps = capsf.property("caps");
+        assert_eq!(
+            want.structure(0).unwrap().get::<i32>("channels").ok(),
+            Some(2)
+        );
 
         // The element really carries the property that makes monitor capture work — read back
         // off the constructed element, not off the config that asked for it.
