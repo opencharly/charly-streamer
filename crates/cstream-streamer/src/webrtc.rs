@@ -110,6 +110,13 @@ pub fn make_sink(encoder: &Encoder) -> Result<gst::Element> {
 
     sink.set_property("video-caps", gst::Caps::builder("video/x-h264").build());
 
+    // Opus for the audio track, constrained the same way and for the same reason: the
+    // audio branch feeds RAW audio in (see `audio`), so without this the sink is free to
+    // negotiate whatever encoder it finds first. Opus is the only audio codec every WebRTC
+    // implementation is required to support, so pinning it removes a class of
+    // browser-specific "connects but no sound" that would look exactly like a capture bug.
+    sink.set_property("audio-caps", gst::Caps::builder("audio/x-opus").build());
+
     // Run the signalling server in-process. Not a convenience: webrtcsink's default
     // signaller DIALS ws://127.0.0.1:8443, and with nothing listening it posts a
     // stream error onto the bus moments after the pipeline reaches PLAYING.
