@@ -77,7 +77,7 @@ fn main() -> Result<()> {
                 cfg.target, cfg.capture_sink
             );
         }
-        None => println!("audio: disabled by CSTREAM_AUDIO=off"),
+        None => println!("audio: off (opt in with CSTREAM_AUDIO=on or a target node name)"),
     }
 
     if let Err(e) = capture.pipeline.set_state(gst::State::Playing) {

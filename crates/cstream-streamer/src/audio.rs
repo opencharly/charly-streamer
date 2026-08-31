@@ -54,23 +54,43 @@ impl Default for AudioConfig {
 }
 
 impl AudioConfig {
-    /// Read the policy from the environment.
+    /// Read the policy from the environment. **Audio is OPT-IN.**
     ///
-    /// `CSTREAM_AUDIO=off` disables the branch entirely and returns `None`; the pipeline is
-    /// then byte-identical to the video-only graph. Any other value, or absence, keeps audio
-    /// on — audio being *silently* absent is the failure this whole module guards against, so
-    /// it is not something a typo should be able to cause.
+    /// Unset or `off` → `None`, and the graph is byte-identical to the video-only one.
+    /// `on` → the default target. Any other value names the target explicitly.
+    ///
+    /// ## Why opt-in, when silent audio is the thing this module guards against
+    ///
+    /// Both failures are real and they pull in opposite directions:
+    ///
+    ///   * audio that connects and carries silence is invisible — hence the assertions here
+    ///     and the bed check on the monitor link;
+    ///   * but a failure to attach aborts the process, and **this process is the Wayland
+    ///     parent**. Measured on `check-cstream-pod`: with audio on by default and the audio
+    ///     path unavailable, `cstream-parent` went FATAL, `cstream-hyprland` restart-looped
+    ///     with no parent display, and the consumer-side frame probe hung for 11 minutes on
+    ///     media that would never arrive. An optional feature took down the product.
+    ///
+    /// Defaulting off resolves that without weakening anything: a deployment that has not
+    /// asked for audio cannot lose its desktop to it, and a deployment that HAS asked still
+    /// gets a loud abort rather than silence. What must never happen is audio that was
+    /// requested and is quietly absent — and that is still impossible.
+    ///
+    /// The audio path is not yet reachable in the pod (`pipewiresrc` reports
+    /// `target not found` for every target, including the default, and no `default` Metadata
+    /// object exists), so nothing enables this yet. `pod-cstream` turns it on when that is
+    /// fixed, and its bed check is what will prove it.
     pub fn from_env() -> Option<Self> {
         match std::env::var("CSTREAM_AUDIO").as_deref() {
-            Ok("off") => None,
-            Ok(target) if !target.is_empty() && target != "on" => Some(Self {
+            Err(_) | Ok("") | Ok("off") => None,
+            Ok("on") => Some(Self::default()),
+            Ok(target) => Some(Self {
                 target: target.to_string(),
                 // An explicitly named target is taken at face value: if a caller points at a
                 // real source, monitor-capture would be wrong. Sinks are the default, not the
                 // only case.
                 capture_sink: target.ends_with("-speaker") || target.ends_with(".monitor"),
             }),
-            _ => Some(Self::default()),
         }
     }
 
@@ -193,6 +213,17 @@ mod tests {
         assert_eq!(with_env(Some("off"), AudioConfig::from_env), None);
     }
 
+    /// The safety property: an unconfigured deployment gets NO audio branch.
+    ///
+    /// This is the test that would have prevented the pod outage. Attaching audio aborts the
+    /// process when the path is unavailable, and the process is the Wayland parent, so a
+    /// default of "on" costs the whole desktop wherever audio is not reachable yet.
+    #[test]
+    fn audio_is_off_unless_asked_for() {
+        assert_eq!(with_env(None, AudioConfig::from_env), None);
+        assert_eq!(with_env(Some(""), AudioConfig::from_env), None);
+    }
+
     /// Actually RUN `attach` — construct the elements, set the properties, link the chain.
     ///
     /// The tests above only exercise the config struct, which would leave every way this can
@@ -239,11 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_on_keeps_audio_with_the_default_target() {
-        assert_eq!(
-            with_env(None, AudioConfig::from_env),
-            Some(AudioConfig::default())
-        );
+    fn on_selects_the_default_target() {
         assert_eq!(
             with_env(Some("on"), AudioConfig::from_env),
             Some(AudioConfig::default())
@@ -251,10 +278,15 @@ mod tests {
     }
 
     #[test]
-    fn a_typo_keeps_audio_on_rather_than_silently_dropping_it() {
-        // "of" is not "off". The failure this module exists to prevent is audio that is
-        // silently absent, so only the exact word disables it.
-        let c = with_env(Some("of"), AudioConfig::from_env).expect("a typo must not disable audio");
+    fn a_typo_does_not_quietly_disable_requested_audio() {
+        // "of" is not "off", so it is not a disable. It is read as a target name and audio
+        // stays ON — which then fails loudly on a node that does not exist.
+        //
+        // Opting in is deliberate (see from_env), but having opted in you must not lose audio
+        // to a typo: that is exactly the silent absence this module exists to prevent, and the
+        // asymmetry is the point. Only the exact word `off` turns it off.
+        let c = with_env(Some("of"), AudioConfig::from_env)
+            .expect("a typo must not silently disable requested audio");
         assert_eq!(c.target, "of");
     }
 
