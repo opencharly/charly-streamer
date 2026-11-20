@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The cstream Wayland streamer: gst-wayland-display source, VA-API encode, WebRTC transport"
+description = "The cstream Wayland streamer: gst-wayland-display source, NVENC or VA-API encode per render node, WebRTC transport"
 
 [dependencies]
 gst.workspace = true
 gst-video.workspace = true
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.25", features = ["v1_24"] }
+serde_json = "1"
 anyhow.workspace = true
-tracing.workspace = true
 
 [lib]
 name = "cstream_streamer"
@@ -19,3 +20,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "cstream-streamer"
 path = "src/main.rs"
+
+[[bin]]
+name = "cstream-input"
+path = "src/bin/cstream-input.rs"
+
+[dev-dependencies]
+# The player's and cstream-input's input JSON is asserted against the real
+# NavigationEvent type webrtcsink deserializes it into.
+gst-video = { workspace = true, features = ["v1_24", "serde"] }

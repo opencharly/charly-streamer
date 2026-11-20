@@ -6,6 +6,7 @@
 //! separately. Linking GWD directly would couple them forever.
 
 use anyhow::{bail, Context, Result};
+use gst::prelude::*;
 use std::time::Duration;
 
 /// The element factory name the layer-gst-wayland-display candy installs.
@@ -18,6 +19,27 @@ pub const FACTORY: &str = "waylanddisplaysrc";
 /// missing message is not fatal to the element but would hang us forever.
 pub const WAYLAND_DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The render node this stream renders and encodes on.
+///
+/// `CSTREAM_RENDER_NODE` when the deployment names one, else `DRINODE`, the render node
+/// charly's device detection injects into every pod it configures. There is no literal
+/// default: on a multi-GPU host a guessed node is the wrong GPU as often as the right
+/// one, and the failure -- a stream on the card nobody chose -- is silent. Choosing among
+/// GPUs is charly's job (DRINODE), overridable per deployment.
+pub fn render_node_from_env() -> Result<String> {
+    render_node_from(|k| std::env::var(k).ok())
+}
+
+/// [`render_node_from_env`] over an injected environment, for tests.
+pub fn render_node_from(get: impl Fn(&str) -> Option<String>) -> Result<String> {
+    for key in ["CSTREAM_RENDER_NODE", "DRINODE"] {
+        if let Some(v) = get(key).filter(|v| !v.trim().is_empty()) {
+            return Ok(v);
+        }
+    }
+    bail!("no render node: set CSTREAM_RENDER_NODE, or deploy through charly, which sets DRINODE")
+}
+
 /// Build the source element for a render node.
 ///
 /// `render_node` is ALWAYS a real DRM node. GWD creates the `zwp_linux_dmabuf_v1`
@@ -25,9 +47,9 @@ pub const WAYLAND_DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 /// that global — so a software render node cannot host a nested compositor at all.
 /// `wl_shm` is not a substitute. Passing a software node here is a configuration
 /// error, not a degraded mode.
-pub fn make_source(render_node: &str) -> Result<gst::Element> {
+pub fn make_source(render_node: &str, cuda_device: Option<i32>) -> Result<gst::Element> {
     if render_node.is_empty() {
-        bail!("render_node is empty — cstream requires a real DRM render node (e.g. /dev/dri/renderD128); there is no software fallback that can host a nested compositor");
+        bail!("render_node is empty — cstream requires a real DRM render node (a /dev/dri/renderD* device, set by CSTREAM_RENDER_NODE); there is no software fallback that can host a nested compositor");
     }
     let src = gst::ElementFactory::make(FACTORY)
         .property("render-node", render_node)
@@ -35,6 +57,12 @@ pub fn make_source(render_node: &str) -> Result<gst::Element> {
         .with_context(|| {
             format!("creating {FACTORY} — is layer-gst-wayland-display installed and on GST_PLUGIN_PATH?")
         })?;
+
+    // The CUDA path: the source allocates CUDAMemory on this device, the one whose
+    // render node it composites on, and NVENC encodes it without a copy.
+    if let Some(id) = cuda_device {
+        src.set_property("cuda-device-id", id);
+    }
 
     // mouse/keyboard take EVDEV DEVICE PATHS. Leaving them unset is part of the
     // security claim: the streamer never opens an input device, it injects events
@@ -82,6 +110,49 @@ pub fn prepare_runtime_dir(dir: &str) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("tightening {dir} to 0700"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod render_node_tests {
+    use super::*;
+
+    #[test]
+    fn the_deployment_override_wins_then_charlys_drinode() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            render_node_from(env(&[
+                ("CSTREAM_RENDER_NODE", "/dev/dri/renderD129"),
+                ("DRINODE", "/dev/dri/renderD128")
+            ]))
+            .unwrap(),
+            "/dev/dri/renderD129"
+        );
+        assert_eq!(
+            render_node_from(env(&[("DRINODE", "/dev/dri/renderD128")])).unwrap(),
+            "/dev/dri/renderD128"
+        );
+        assert_eq!(
+            render_node_from(env(&[
+                ("CSTREAM_RENDER_NODE", " "),
+                ("DRINODE", "/dev/dri/renderD128")
+            ]))
+            .unwrap(),
+            "/dev/dri/renderD128",
+            "a blank override is unset, not a node"
+        );
+        let err = render_node_from(env(&[])).unwrap_err().to_string();
+        assert!(
+            err.contains("CSTREAM_RENDER_NODE") && err.contains("DRINODE"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //! nothing about a resize; the requested size has to be checked directly, and the
 //! values that reach the caps have to be ones the encoder can represent.
 
-use cstream_streamer::pipeline::Geometry;
+use cstream_streamer::pipeline::{Geometry, Memory};
 
 #[test]
 fn odd_sizes_round_to_eight() {
@@ -46,15 +46,39 @@ fn the_default_is_the_spec_geometry() {
     assert_eq!((g.width, g.height, g.framerate), (1920, 1080, 60));
 }
 
+/// Each capture memory puts its feature on the caps -- that feature is what forces
+/// the zero-copy path; without it the chain silently becomes a CPU copy that still
+/// works. System memory (software encode) carries none.
 #[test]
-fn caps_carry_the_dmabuf_feature_which_forces_zero_copy() {
+fn caps_carry_the_memory_feature_which_forces_zero_copy() {
     gst::init().unwrap();
-    let caps = Geometry::default().dmabuf_caps();
-    let s = caps.structure(0).unwrap();
-    assert_eq!(s.name(), "video/x-raw");
-    assert_eq!(s.get::<i32>("width").unwrap(), 1920);
-    assert!(
-        caps.features(0).unwrap().contains("memory:DMABuf"),
-        "without the DMABuf feature the chain silently becomes a CPU copy that still works"
+    for (memory, feature) in [
+        (Memory::DmaBuf, Some("memory:DMABuf")),
+        (Memory::Cuda, Some("memory:CUDAMemory")),
+        (Memory::System, None),
+    ] {
+        let caps = Geometry::default().caps(memory);
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.name(), "video/x-raw");
+        assert_eq!(s.get::<i32>("width").unwrap(), 1920);
+        let f = caps.features(0).unwrap();
+        match feature {
+            Some(want) => assert!(f.contains(want), "{memory:?} caps lack {want}"),
+            None => assert!(
+                f.is_any() || f.contains("memory:SystemMemory") || f.size() == 0,
+                "{memory:?} caps carry {f:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_backend_decides_the_capture_memory() {
+    use cstream_streamer::rank::Backend;
+    assert_eq!(Memory::for_backend(Some(&Backend::Va)), Memory::DmaBuf);
+    assert_eq!(
+        Memory::for_backend(Some(&Backend::Cuda { device_id: 0 })),
+        Memory::Cuda
     );
+    assert_eq!(Memory::for_backend(None), Memory::System);
 }

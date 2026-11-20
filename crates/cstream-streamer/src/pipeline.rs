@@ -1,14 +1,20 @@
 //! The capture pipeline.
 //!
-//! The graph is `waylanddisplaysrc ! DMABuf caps ! vapostproc ! <encoder>`, and the
-//! DMABuf caps filter is the load-bearing part: it is what forces the zero-copy path.
-//! Without it the source may negotiate system memory and the whole chain silently
-//! becomes a CPU copy that still "works".
+//! The graph follows the render node's encode backend (`rank::Backend`):
+//!
+//! - VA:   `waylanddisplaysrc ! memory:DMABuf caps ! vapostproc ! <sink>`
+//! - CUDA: `waylanddisplaysrc cuda-device-id=N ! memory:CUDAMemory caps ! <sink>`
+//! - none: `waylanddisplaysrc ! system-memory caps ! <sink>` (software encode)
+//!
+//! The memory feature on the caps filter is the load-bearing part: it is what forces
+//! the zero-copy path. Without it the source may negotiate system memory and the
+//! whole chain silently becomes a CPU copy that still "works".
 
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
 use crate::display;
+use crate::rank::Backend;
 
 /// Video geometry for the capture chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,14 +49,44 @@ impl Geometry {
         }
     }
 
-    /// The DMABuf caps that force the zero-copy path.
-    pub fn dmabuf_caps(&self) -> gst::Caps {
-        gst::Caps::builder("video/x-raw")
-            .features(["memory:DMABuf"])
+    /// The caps that force the zero-copy path for `memory`.
+    pub fn caps(&self, memory: Memory) -> gst::Caps {
+        let b = gst::Caps::builder("video/x-raw")
             .field("width", self.width as i32)
             .field("height", self.height as i32)
-            .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
-            .build()
+            .field("framerate", gst::Fraction::new(self.framerate as i32, 1));
+        match memory.feature() {
+            Some(f) => b.features([f]).build(),
+            None => b.build(),
+        }
+    }
+}
+
+/// Where captured frames live, which decides the caps the source is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Memory {
+    DmaBuf,
+    Cuda,
+    System,
+}
+
+impl Memory {
+    /// The capture memory for an encode backend; `None` (software encode) captures
+    /// to system memory, which every software encoder reads.
+    pub fn for_backend(backend: Option<&Backend>) -> Self {
+        match backend {
+            Some(Backend::Va) => Self::DmaBuf,
+            Some(Backend::Cuda { .. }) => Self::Cuda,
+            None => Self::System,
+        }
+    }
+
+    fn feature(self) -> Option<&'static str> {
+        match self {
+            Self::DmaBuf => Some("memory:DMABuf"),
+            Self::Cuda => Some("memory:CUDAMemory"),
+            Self::System => None,
+        }
     }
 }
 
@@ -60,9 +96,11 @@ pub struct Capture {
     pub source: gst::Element,
     /// The caps filter a resize rewrites. Named `size` so it is findable by name too.
     pub size: gst::Element,
+    /// The memory the caps filter holds the source to; a resize keeps it.
+    pub memory: Memory,
 }
 
-/// Build `waylanddisplaysrc ! DMABuf caps ! vapostproc`, ending at `sink`.
+/// Build the capture graph for `backend`, ending at `sink` (see the module docs).
 ///
 /// `frame_dir`, when set, adds a second branch off a `tee` that writes one JPEG per
 /// second into that directory.
@@ -77,28 +115,46 @@ pub struct Capture {
 /// but no media.
 pub fn build_capture(
     render_node: &str,
+    backend: Option<&Backend>,
     geom: Geometry,
     sink: gst::Element,
     frame_dir: Option<&str>,
 ) -> Result<Capture> {
     let geom = geom.sanitised();
+    let memory = Memory::for_backend(backend);
     let pipeline = gst::Pipeline::new();
-    let source = display::make_source(render_node)?;
+    let cuda_device = match backend {
+        Some(Backend::Cuda { device_id }) => Some(*device_id),
+        _ => None,
+    };
+    let source = display::make_source(render_node, cuda_device)?;
 
     let size = gst::ElementFactory::make("capsfilter")
         .name("size")
-        .property("caps", geom.dmabuf_caps())
+        .property("caps", geom.caps(memory))
         .build()
         .context("creating the size capsfilter")?;
 
-    let convert = gst::ElementFactory::make("vapostproc")
-        .build()
-        .context("creating vapostproc — is gstreamer-vaapi/va installed?")?;
-
     pipeline
-        .add_many([&source, &size, &convert])
+        .add_many([&source, &size])
         .context("adding the capture elements")?;
-    gst::Element::link_many([&source, &size, &convert]).context("linking the capture chain")?;
+    source
+        .link(&size)
+        .context("linking the source to its caps")?;
+
+    // VA needs vapostproc between the DMABuf source and the encoder; CUDA and system
+    // memory feed the sink directly.
+    let convert = if memory == Memory::DmaBuf {
+        let vapostproc = gst::ElementFactory::make("vapostproc")
+            .build()
+            .context("creating vapostproc — is gst-plugin-va installed?")?;
+        pipeline.add(&vapostproc).context("adding vapostproc")?;
+        size.link(&vapostproc)
+            .context("linking the caps to vapostproc")?;
+        vapostproc
+    } else {
+        size.clone()
+    };
 
     match frame_dir {
         None => {
@@ -117,6 +173,16 @@ pub fn build_capture(
             // stutters for a reason that has nothing to do with the stream.
             let q_sink = gst::ElementFactory::make("queue").build()?;
             let q_tap = gst::ElementFactory::make("queue").build()?;
+            // The tap converts on the CPU, so CUDA frames are downloaded first.
+            let download = if memory == Memory::Cuda {
+                Some(
+                    gst::ElementFactory::make("cudadownload")
+                        .build()
+                        .context("creating cudadownload for the frame tap")?,
+                )
+            } else {
+                None
+            };
             let rate = gst::ElementFactory::make("videorate").build()?;
             let rate_caps = gst::ElementFactory::make("capsfilter")
                 .property(
@@ -141,8 +207,13 @@ pub fn build_capture(
                 .context("adding the tee branches")?;
             convert.link(&tee).context("linking convert to the tee")?;
             gst::Element::link_many([&q_sink, &sink]).context("linking the encoder branch")?;
-            gst::Element::link_many([&q_tap, &rate, &rate_caps, &conv2, &enc, &files])
-                .context("linking the frame tap")?;
+            let mut tap: Vec<&gst::Element> = vec![&q_tap];
+            if let Some(d) = download.as_ref() {
+                pipeline.add(d).context("adding cudadownload")?;
+                tap.push(d);
+            }
+            tap.extend([&rate, &rate_caps, &conv2, &enc, &files]);
+            gst::Element::link_many(tap).context("linking the frame tap")?;
             tee.link(&q_sink)
                 .context("linking the tee to the encoder branch")?;
             tee.link(&q_tap)
@@ -154,13 +225,14 @@ pub fn build_capture(
         pipeline,
         source,
         size,
+        memory,
     })
 }
 
 /// Apply a new geometry to a running capture by rewriting the `size` filter.
 pub fn apply_geometry(capture: &Capture, geom: Geometry) -> Geometry {
     let geom = geom.sanitised();
-    capture.size.set_property("caps", geom.dmabuf_caps());
+    capture.size.set_property("caps", geom.caps(capture.memory));
     geom
 }
 
@@ -188,8 +260,19 @@ mod tap_tests {
             Ok(s) => s,
             Err(_) => return,
         };
+        // Any render node this host has; none means the tap shape is asserted on a
+        // host that does.
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("renderD"))
+            })
+        }) else {
+            return;
+        };
         let cap = match build_capture(
-            "/dev/dri/renderD128",
+            node.to_str().unwrap(),
+            None,
             Geometry::default(),
             sink,
             Some(dir.to_str().unwrap()),

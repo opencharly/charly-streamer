@@ -9,7 +9,6 @@ license = "MIT"
 repository = "https://github.com/opencharly/charly-streamer"
 
 [workspace.dependencies]
-gst = { package = "gstreamer", version = "0.23" }
-gst-video = { package = "gstreamer-video", version = "0.23" }
+gst = { package = "gstreamer", version = "0.25" }
+gst-video = { package = "gstreamer-video", version = "0.25" }
 anyhow = "1"
-tracing = "0.1"

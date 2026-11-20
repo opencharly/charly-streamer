@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cstream</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; }
+  #login { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #login form { display: grid; gap: 8px; padding: 24px; background: #1d1f24; border-radius: 8px; min-width: 260px; }
+  #login input, #login button { font: inherit; padding: 6px 8px; }
+  #login-error { color: #f77; min-height: 1.2em; margin: 0; }
+  #screen { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; outline: none; background: #000; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body data-state="login">
+<div id="login">
+  <form id="login-form" autocomplete="on">
+    <strong>cstream</strong>
+    <input id="login-user" name="user" autocomplete="username" placeholder="user" required>
+    <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="password" required>
+    <button id="login-submit" type="submit">Log in</button>
+    <p id="login-error" role="alert"></p>
+  </form>
+</div>
+<!-- tabindex makes the video focusable, so keyboard input is captured only while
+     the desktop has focus and never steals keys from the login form. -->
+<video id="screen" data-state="idle" tabindex="0" autoplay playsinline muted hidden></video>
+<script src="player.js"></script>
+</body>
+</html>

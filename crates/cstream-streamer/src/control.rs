@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
-use crate::pipeline::Geometry;
+use crate::pipeline::{Geometry, Memory};
 
 /// Minimum interval between APPLIED resizes.
 ///
@@ -32,14 +32,16 @@ const MIN_RESIZE_INTERVAL: Duration = Duration::from_millis(500);
 /// Owns the one element a resize rewrites, plus the rate-limit state.
 pub struct Control {
     size: gst::Element,
+    memory: Memory,
     last_applied: Option<Instant>,
     current: Geometry,
 }
 
 impl Control {
-    pub fn new(size: gst::Element, initial: Geometry) -> Self {
+    pub fn new(size: gst::Element, memory: Memory, initial: Geometry) -> Self {
         Self {
             size,
+            memory,
             last_applied: None,
             current: initial.sanitised(),
         }
@@ -85,7 +87,7 @@ impl Control {
                 );
             }
         }
-        self.size.set_property("caps", want.dmabuf_caps());
+        self.size.set_property("caps", want.caps(self.memory));
         self.last_applied = Some(now);
         self.current = want;
         Ok(want)
@@ -195,10 +197,10 @@ mod tests {
             framerate: 60,
         };
         let size = gst::ElementFactory::make("capsfilter")
-            .property("caps", start.dmabuf_caps())
+            .property("caps", start.caps(Memory::DmaBuf))
             .build()
             .unwrap();
-        (Control::new(size.clone(), start), size)
+        (Control::new(size.clone(), Memory::DmaBuf, start), size)
     }
 
     // 1600x900 is deliberately the example: 900 is NOT a multiple of 8, so the

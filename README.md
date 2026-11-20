@@ -1,19 +1,53 @@
 # charly-streamer
 
-The cstream server side: a Wayland desktop streamed over WebRTC.
+The cstream server side: a Wayland desktop streamed to a browser over WebRTC.
 
-`cstream-streamer` embeds `gst-wayland-display` as the Wayland parent, encodes with
-VA-API where the host has it, and transports over WebRTC.
+- **`cstream-streamer`** *is* the Wayland parent. It embeds gst-wayland-display's
+  compositor (`waylanddisplaysrc`), encodes on the render node's own GPU, and serves
+  the stream with webrtcsink.
+- **`cstream-gateway`** is the one network-facing port (`:8080`). It serves the browser
+  player, logs users in through PAM, and proxies the WebRTC signalling to the streamer,
+  which listens on loopback only.
+- **`cstream-leader`** authenticates a user through PAM and drops privileges.
+- **`cstream-input`** is the test client. It joins the stream as a viewer and drives
+  the desktop through the same control channel the browser uses.
 
-## Why these three modules exist
+## Encoding follows the render node
+
+| render node's driver | capture | encoder |
+|---|---|---|
+| `nvidia` | `memory:CUDAMemory` (`cuda-device-id` in PCI bus order) | `nvh264enc` |
+| `amdgpu`, `i915`, `xe` | `memory:DMABuf` → `vapostproc` | `vah264enc` |
+| anything else | system memory | software (only under `CSTREAM_ENCODE=auto`) |
+
+The render node is `CSTREAM_RENDER_NODE`, else charly's injected `DRINODE`.
+`CSTREAM_ENCODE` is one of:
+- `auto`: hardware, else software;
+- `hardware`: fail rather than fall back;
+- `software`.
+
+## Browser and input
+
+The player (`cmd/cstream-gateway/web/`):
+1. logs in (`POST /login`);
+2. opens the authenticated `/signalling` WebSocket;
+3. plays the H.264 track;
+4. sends keyboard, pointer and wheel input as GstNavigation events over webrtcsink's
+   `control` data channel.
+
+waylanddisplaysrc maps those events onto its seat.
+
+## Why these modules exist
 
 Each covers something that fails **silently** if it regresses:
 
-- **`rank`** — webrtcsink enumerates encoders once into a `LazyLock`, and `vah264enc`
-  registers at `GST_RANK_NONE`. Promote it late and the stream quietly runs on the CPU.
-- **`display`** — the source is created *from the registry*, never as a crate, so this
-  crate's gstreamer-rs generation stays independent of the one GWD was built against.
-  The render node is always a real DRM node: GWD creates `zwp_linux_dmabuf_v1` only on
-  the hardware path, and a nested compositor hard-requires that global.
-- **`input`** — GWD `.expect()`s each event field at a specific type. A mismatch panics
-  the element thread rather than degrading, so the types are the wire contract.
+- **`rank`** decides the backend from the render node and promotes ONLY that
+  backend's encoders. webrtcsink enumerates encoders once, so a late or wrong promotion
+  streams on the CPU, or on the other GPU.
+- **`display`** creates the source *from the registry*, never as a crate, so this
+  crate's gstreamer-rs generation stays independent of GWD's. The render node is always
+  a real DRM node: GWD creates `zwp_linux_dmabuf_v1` only on the hardware path.
+- **`keys`** maps text to US-layout physical keys. A shifted keysym name (`exclam`)
+  would press the key without Shift and type the wrong character.
+- **`lifecycle`** locks the desktop through `org.freedesktop.ScreenSaver.Lock` once the
+  last viewer has been gone long enough (`CSTREAM_LOCK_AFTER`).
