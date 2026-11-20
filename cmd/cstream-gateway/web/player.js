@@ -47,6 +47,8 @@ let ws = null;
 let pc = null;
 let sessionId = null;
 let control = null;
+// The video stream's mid (from its transceiver): input is addressed to it, see controlMessage.
+let videoMid = null;
 let controlId = 1;
 
 function send(msg) {
@@ -106,6 +108,7 @@ function ensurePeerConnection() {
   // are the whole path. A STUN server would only add an external dependency.
   pc = new RTCPeerConnection({ iceServers: [] });
   pc.ontrack = (ev) => {
+    if (ev.track.kind === "video") videoMid = ev.transceiver.mid;
     if (!video.srcObject) video.srcObject = ev.streams[0] || new MediaStream([ev.track]);
   };
   pc.ondatachannel = (ev) => {
@@ -143,94 +146,53 @@ video.addEventListener("playing", () => {
 
 // ---- input -----------------------------------------------------------------
 
-// KeyboardEvent.code (the PHYSICAL key) -> the X keysym name waylanddisplaysrc maps
-// to an evdev scancode. Physical, not KeyboardEvent.key: the remote seat applies its
-// own XKB layout, so sending the logical character would double-apply the layout.
-const CODE_TO_KEYSYM = (() => {
-  const m = {
-    Escape: "Escape", Backspace: "BackSpace", Tab: "Tab", Enter: "Return", Space: "space",
-    Minus: "minus", Equal: "equal", BracketLeft: "bracketleft", BracketRight: "bracketright",
-    Backslash: "backslash", IntlBackslash: "backslash", Semicolon: "semicolon", Quote: "apostrophe",
-    Backquote: "grave", Comma: "comma", Period: "period", Slash: "slash",
-    ShiftLeft: "Shift_L", ShiftRight: "Shift_R", ControlLeft: "Control_L", ControlRight: "Control_R",
-    AltLeft: "Alt_L", AltRight: "Alt_R", MetaLeft: "Super_L", MetaRight: "Super_R",
-    CapsLock: "Caps_Lock", NumLock: "Num_Lock", ScrollLock: "Scroll_Lock", Pause: "Pause",
-    ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
-    Home: "Home", End: "End", PageUp: "Page_Up", PageDown: "Page_Down", Insert: "Insert", Delete: "Delete",
-    NumpadEnter: "KP_Enter", NumpadAdd: "KP_Add", NumpadSubtract: "KP_Subtract",
-    NumpadMultiply: "KP_Multiply", NumpadDivide: "KP_Divide", NumpadDecimal: "KP_Decimal",
-  };
-  for (let c = 65; c <= 90; c++) m["Key" + String.fromCharCode(c)] = String.fromCharCode(c + 32);
-  for (let d = 0; d <= 9; d++) { m["Digit" + d] = String(d); m["Numpad" + d] = "KP_" + d; }
-  for (let f = 1; f <= 12; f++) m["F" + f] = "F" + f;
-  return m;
-})();
-
-// GstNavigationModifierType as gstreamer-rs' serde writes it: the flag nicks joined
-// by "+", or "" for none. The field is REQUIRED -- webrtcsink drops an event without
-// it as invalid -- and an unknown nick fails the same way, so only these four are sent.
-function modifierState(e) {
-  const m = [];
-  if (e.shiftKey) m.push("shift-mask");
-  if (e.ctrlKey) m.push("control-mask");
-  if (e.altKey) m.push("mod1-mask");
-  if (e.metaKey) m.push("super-mask");
-  return m.join("+");
-}
+const { keyFor, modifierState, streamPoint, navButton, controlMessage, wheelDeltas } = CstreamInput;
 
 function sendNav(e, event) {
-  if (!control || control.readyState !== "open") return;
-  event.modifier_state = modifierState(e);
-  control.send(JSON.stringify({ id: controlId++, mid: null, request: { type: "navigationEvent", event } }));
+  if (!control || control.readyState !== "open" || !videoMid) return;
+  control.send(controlMessage(controlId++, event, modifierState(e), videoMid));
 }
 
-// Map a client point on the <video> element to stream pixels, accounting for the
-// letterboxing object-fit: contain introduces.
-function streamPoint(e) {
-  const r = video.getBoundingClientRect();
-  const vw = video.videoWidth || 1, vh = video.videoHeight || 1;
-  const scale = Math.min(r.width / vw, r.height / vh);
-  const ox = r.left + (r.width - vw * scale) / 2;
-  const oy = r.top + (r.height - vh * scale) / 2;
-  const x = Math.min(Math.max((e.clientX - ox) / scale, 0), vw - 1);
-  const y = Math.min(Math.max((e.clientY - oy) / scale, 0), vh - 1);
-  return { x, y };
-}
-
-// DOM button numbering (0 left, 1 middle, 2 right) -> GstNavigation (1, 2, 3).
-const navButton = (b) => (b === 1 ? 2 : b === 2 ? 3 : 1);
+const pointAt = (e) => streamPoint(video.getBoundingClientRect(), video.videoWidth, video.videoHeight, e.clientX, e.clientY);
 
 video.addEventListener("keydown", (e) => {
-  const key = CODE_TO_KEYSYM[e.code];
-  if (!key) return;
+  const k = keyFor(e);
+  if (!k) return;
   e.preventDefault();
-  sendNav(e, { event: "KeyPress", key });
+  if (k.shift) sendNav(e, { event: "KeyPress", key: "Shift_L" });
+  sendNav(e, { event: "KeyPress", key: k.key });
+  // A synthesized shifted character gets its release right away: a source that
+  // sends no `code` gives no guarantee its keyup will carry the same `key`.
+  if (k.shift) {
+    sendNav(e, { event: "KeyRelease", key: k.key });
+    sendNav(e, { event: "KeyRelease", key: "Shift_L" });
+  }
 });
 video.addEventListener("keyup", (e) => {
-  const key = CODE_TO_KEYSYM[e.code];
-  if (!key) return;
+  const k = keyFor(e);
+  if (!k || k.shift) return;
   e.preventDefault();
-  sendNav(e, { event: "KeyRelease", key });
+  sendNav(e, { event: "KeyRelease", key: k.key });
 });
 video.addEventListener("mousemove", (e) => {
-  const p = streamPoint(e);
+  const p = pointAt(e);
   sendNav(e, { event: "MouseMove", x: p.x, y: p.y });
 });
 video.addEventListener("mousedown", (e) => {
   video.focus();
-  const p = streamPoint(e);
+  const p = pointAt(e);
   e.preventDefault();
   sendNav(e, { event: "MouseButtonPress", button: navButton(e.button), x: p.x, y: p.y });
 });
 video.addEventListener("mouseup", (e) => {
-  const p = streamPoint(e);
+  const p = pointAt(e);
   e.preventDefault();
   sendNav(e, { event: "MouseButtonRelease", button: navButton(e.button), x: p.x, y: p.y });
 });
 video.addEventListener("wheel", (e) => {
-  const p = streamPoint(e);
+  const p = pointAt(e);
   e.preventDefault();
-  sendNav(e, { event: "MouseScroll", x: p.x, y: p.y, delta_x: e.deltaX, delta_y: e.deltaY });
+  sendNav(e, Object.assign({ event: "MouseScroll", x: p.x, y: p.y }, wheelDeltas(e.deltaX, e.deltaY, e.deltaMode)));
 }, { passive: false });
 video.addEventListener("contextmenu", (e) => e.preventDefault());
 

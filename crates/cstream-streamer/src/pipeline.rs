@@ -34,17 +34,73 @@ impl Default for Geometry {
     }
 }
 
+/// The frame sizes the stream can carry: the chosen encoder's OWN limits, read from its
+/// sink pad template. Not a constant: NVENC H.264 takes 160..4096 x 64..4096, NVENC
+/// H.265 144..8192 x 48..8192 (measured with gst-inspect), and a portrait phone window
+/// or a 5K ultrawide is valid for one encoder and not for another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimits {
+    pub width: (u32, u32),
+    pub height: (u32, u32),
+}
+
+impl SizeLimits {
+    /// The union of the width/height ranges across the caps' structures. None when no
+    /// structure bounds both.
+    pub fn from_caps(caps: &gst::CapsRef) -> Option<Self> {
+        fn range(s: &gst::StructureRef, field: &str) -> Option<(u32, u32)> {
+            if let Ok(r) = s.get::<gst::IntRange<i32>>(field) {
+                return Some((r.min().max(1) as u32, r.max().max(1) as u32));
+            }
+            s.get::<i32>(field)
+                .ok()
+                .map(|v| (v.max(1) as u32, v.max(1) as u32))
+        }
+        let mut out: Option<Self> = None;
+        for s in caps.iter() {
+            let (Some(w), Some(h)) = (range(s, "width"), range(s, "height")) else {
+                continue;
+            };
+            out = Some(match out {
+                None => Self {
+                    width: w,
+                    height: h,
+                },
+                Some(o) => Self {
+                    width: (o.width.0.min(w.0), o.width.1.max(w.1)),
+                    height: (o.height.0.min(h.0), o.height.1.max(h.1)),
+                },
+            });
+        }
+        out
+    }
+
+    /// The limits of the element `factory` would create, from its sink pad template.
+    pub fn of_factory(factory: &str) -> Result<Self> {
+        let f = gst::ElementFactory::find(factory)
+            .with_context(|| format!("no {factory} in the GStreamer registry"))?;
+        f.static_pad_templates()
+            .iter()
+            .filter(|t| t.direction() == gst::PadDirection::Sink)
+            .find_map(|t| Self::from_caps(&t.caps()))
+            .with_context(|| format!("{factory}'s sink template bounds no frame size"))
+    }
+}
+
 impl Geometry {
-    /// Clamp and round to what the compositor can actually configure.
-    ///
-    /// Rounding to 8 matters: an odd width reaches the encoder as a size it cannot
-    /// represent, and the failure surfaces far from the resize that caused it.
-    pub fn sanitised(self) -> Self {
-        let w = self.width.clamp(640, 3840) & !7;
-        let h = self.height.clamp(480, 2160) & !7;
+    /// Fit a requested size to what the stream can carry: inside the encoder's own
+    /// limits, and EVEN in both dimensions -- the one constraint 4:2:0 chroma imposes
+    /// (an odd size cannot be subsampled). Nothing else is rounded: H.264 codes sizes
+    /// that are not a multiple of 16 by cropping, so 1366x768 stays 1366x768.
+    pub fn sanitised(self, limits: &SizeLimits) -> Self {
+        let fit = |v: u32, (lo, hi): (u32, u32)| {
+            let lo = lo + (lo & 1); // the smallest EVEN size the encoder takes
+            let hi = (hi & !1).max(lo); // the largest EVEN size the encoder takes
+            (v & !1).clamp(lo, hi)
+        };
         Self {
-            width: w,
-            height: h,
+            width: fit(self.width, limits.width),
+            height: fit(self.height, limits.height),
             framerate: self.framerate.clamp(1, 240),
         }
     }
@@ -117,10 +173,11 @@ pub fn build_capture(
     render_node: &str,
     backend: Option<&Backend>,
     geom: Geometry,
+    limits: &SizeLimits,
     sink: gst::Element,
     frame_dir: Option<&str>,
 ) -> Result<Capture> {
-    let geom = geom.sanitised();
+    let geom = geom.sanitised(limits);
     let memory = Memory::for_backend(backend);
     let pipeline = gst::Pipeline::new();
     let cuda_device = match backend {
@@ -229,13 +286,6 @@ pub fn build_capture(
     })
 }
 
-/// Apply a new geometry to a running capture by rewriting the `size` filter.
-pub fn apply_geometry(capture: &Capture, geom: Geometry) -> Geometry {
-    let geom = geom.sanitised();
-    capture.size.set_property("caps", geom.caps(capture.memory));
-    geom
-}
-
 #[cfg(test)]
 mod tap_tests {
     use super::*;
@@ -274,6 +324,10 @@ mod tap_tests {
             node.to_str().unwrap(),
             None,
             Geometry::default(),
+            &SizeLimits {
+                width: (16, 8192),
+                height: (16, 8192),
+            },
             sink,
             Some(dir.to_str().unwrap()),
         ) {

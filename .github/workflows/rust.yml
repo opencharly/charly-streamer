@@ -49,6 +49,9 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Player unit tests (node --test)
+        run: node --test cmd/cstream-gateway/web
+
       - name: Go build and test (CGO_ENABLED=0)
         run: |
           CGO_ENABLED=0 go build ./...

@@ -121,8 +121,9 @@ func TestPlayerIsServed(t *testing.T) {
 	srv := httptest.NewServer(g.routes())
 	defer srv.Close()
 	for path, want := range map[string][]string{
-		"/":          {`id="login-form"`, `id="login-user"`, `id="login-password"`, `id="screen"`, `data-state="idle"`, `src="player.js"`},
-		"/player.js": {`"/signalling"`, `"navigationEvent"`, `"control"`, `CODE_TO_KEYSYM`},
+		"/":          {`id="login-form"`, `id="login-user"`, `id="login-password"`, `id="screen"`, `data-state="idle"`, `src="input.js"`, `src="player.js"`},
+		"/player.js": {`"/signalling"`, `"control"`, `CstreamInput`},
+		"/input.js":  {`CODE_TO_KEYSYM`, `"navigationEvent"`, `modifier_state`},
 	} {
 		resp, err := http.Get(srv.URL + path)
 		if err != nil {

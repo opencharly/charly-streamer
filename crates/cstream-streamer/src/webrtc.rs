@@ -6,6 +6,7 @@
 //! fraction of the density and nothing says so. `encode: hardware` therefore has to
 //! fail LOUDLY rather than degrade, and `auto` has to report which branch it took.
 
+use crate::pipeline::SizeLimits;
 use anyhow::{anyhow, Context, Result};
 use gst::prelude::*;
 
@@ -51,6 +52,23 @@ impl Encoder {
         match self {
             Self::Hardware(name) => format!("hardware:{name}"),
             Self::Software => "software".to_string(),
+        }
+    }
+
+    /// The frame sizes this encoder can carry, from its own sink template. Software is
+    /// the H.264 software encoder webrtcsink uses (x264enc, else openh264enc).
+    pub fn limits(&self) -> Result<SizeLimits> {
+        match self {
+            Self::Hardware(name) => SizeLimits::of_factory(name),
+            Self::Software => ["x264enc", "openh264enc"]
+                .into_iter()
+                .find(|n| registry_has(n))
+                .map(SizeLimits::of_factory)
+                .unwrap_or_else(|| {
+                    Err(anyhow!(
+                        "no H.264 software encoder (x264enc, openh264enc) to size the stream for"
+                    ))
+                }),
         }
     }
 }

@@ -33,9 +33,20 @@ The player (`cmd/cstream-gateway/web/`):
 2. opens the authenticated `/signalling` WebSocket;
 3. plays the H.264 track;
 4. sends keyboard, pointer and wheel input as GstNavigation events over webrtcsink's
-   `control` data channel.
+   `control` data channel, addressed to the VIDEO stream's `mid`.
 
-waylanddisplaysrc maps those events onto its seat.
+waylanddisplaysrc maps those events onto its seat. The address matters: with no `mid`,
+webrtcsink pushes an event into every input stream (audio too) and acknowledges it if
+any of them took it, so the acknowledgement would not prove the desktop received
+anything. Addressed to the video stream, the acknowledgement is waylanddisplaysrc's own
+verdict. `cstream-input` (the test client) does the same.
+
+The stream follows the viewer's size live (the gateway's control socket, `resize W H`).
+Any size inside the chosen encoder's own limits applies exactly, provided it is even
+in both dimensions, the one constraint 4:2:0 imposes. So 1366x768, a portrait 390x844
+and 4096x2160 on NVENC all stream at their own size. The limits are read from the
+encoder's sink template, not hard-coded: NVENC H.264 accepts 160..4096 x 64..4096,
+NVENC H.265 up to 8192.
 
 ## Why these modules exist
 

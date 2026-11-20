@@ -54,7 +54,7 @@ fn an_event_without_modifier_state_is_rejected() {
 /// `navigationEvent` whose `event` is the NavigationEvent above.
 #[test]
 fn the_control_envelope_carries_the_event() {
-    let msg = r#"{"id":1,"mid":null,"request":{"type":"navigationEvent","event":{"event":"KeyPress","key":"a","modifier_state":""}}}"#;
+    let msg = r#"{"id":1,"mid":"video0","request":{"type":"navigationEvent","event":{"event":"KeyPress","key":"a","modifier_state":""}}}"#;
     let v: serde_json::Value = serde_json::from_str(msg).unwrap();
     assert_eq!(v["request"]["type"], "navigationEvent");
     init();

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
-use crate::pipeline::{Geometry, Memory};
+use crate::pipeline::{Geometry, Memory, SizeLimits};
 
 /// Minimum interval between APPLIED resizes.
 ///
@@ -33,17 +33,19 @@ const MIN_RESIZE_INTERVAL: Duration = Duration::from_millis(500);
 pub struct Control {
     size: gst::Element,
     memory: Memory,
+    limits: SizeLimits,
     last_applied: Option<Instant>,
     current: Geometry,
 }
 
 impl Control {
-    pub fn new(size: gst::Element, memory: Memory, initial: Geometry) -> Self {
+    pub fn new(size: gst::Element, memory: Memory, limits: SizeLimits, initial: Geometry) -> Self {
         Self {
             size,
             memory,
+            limits,
             last_applied: None,
-            current: initial.sanitised(),
+            current: initial.sanitised(&limits),
         }
     }
 
@@ -54,10 +56,10 @@ impl Control {
 
     /// Apply a resize, returning the geometry ACTUALLY applied.
     ///
-    /// The return value is the point of this signature. `sanitised()` clamps to
-    /// 640x480..3840x2160 and rounds to a multiple of 8, so a request is routinely
-    /// not what lands -- and a caller that assumes otherwise writes a gate that
-    /// passes on a compositor which quietly ignored it. The plan records the
+    /// The return value is the point of this signature. `sanitised()` fits the request
+    /// to the encoder's own limits and to even dimensions, so a request outside them is
+    /// not what lands -- and a caller that assumes otherwise writes a gate that passes
+    /// on a compositor which quietly ignored it. The plan records the
     /// concrete instance: Aquamarine snaps an unsatisfiable configure to 1280x720
     /// with no error at all.
     pub fn resize(&mut self, width: u32, height: u32, now: Instant) -> Result<Geometry> {
@@ -66,7 +68,7 @@ impl Control {
             height,
             framerate: self.current.framerate,
         }
-        .sanitised();
+        .sanitised(&self.limits);
 
         // A no-op resize is not rate-limited: it applies nothing, so it cannot
         // cost a renegotiation, and refusing it would make an idempotent retry
@@ -200,38 +202,55 @@ mod tests {
             .property("caps", start.caps(Memory::DmaBuf))
             .build()
             .unwrap();
-        (Control::new(size.clone(), Memory::DmaBuf, start), size)
+        (
+            Control::new(size.clone(), Memory::DmaBuf, NVENC_H264, start),
+            size,
+        )
     }
 
-    // 1600x900 is deliberately the example: 900 is NOT a multiple of 8, so the
-    // applied height is 896. A gate that asserts the REQUESTED 900 fails against
-    // correct behaviour -- which is why `resize` returns what applied and why the
-    // bed asserts that value rather than the request.
+    /// NVENC H.264's measured sink-template limits (gst-inspect-1.0 nvh264enc).
+    const NVENC_H264: SizeLimits = SizeLimits {
+        width: (160, 4096),
+        height: (64, 4096),
+    };
+
+    // Any even size inside the encoder's limits applies EXACTLY: 1366x768 and a
+    // portrait 390x844 are real browser windows, and nothing rounds them.
     #[test]
-    fn a_resize_rewrites_the_capsfilter_to_the_sanitised_size() {
-        let (mut c, size) = fixture();
-        let g = c.resize(1600, 900, Instant::now()).unwrap();
-        assert_eq!((g.width, g.height), (1600, 896), "900 rounds down to 896");
-        assert_eq!(caps_geometry(&size), (1600, 896));
+    fn a_resize_rewrites_the_capsfilter_to_the_exact_even_size() {
+        for (w, h) in [(1600, 900), (1366, 768), (390, 844), (2560, 1080)] {
+            let (mut c, size) = fixture();
+            let g = c.resize(w, h, Instant::now()).unwrap();
+            assert_eq!((g.width, g.height), (w, h));
+            assert_eq!(caps_geometry(&size), (w as i32, h as i32));
+        }
     }
 
-    // The clamp and the round are not cosmetic: an odd width reaches the encoder as
-    // a size it cannot represent, and the failure surfaces far from the resize.
+    // Outside the encoder's limits the request is fitted to them, and to even
+    // dimensions (4:2:0), and the caller is told what applied.
     #[test]
-    fn an_out_of_range_request_is_clamped_and_the_caller_is_told_what_applied() {
+    fn an_out_of_range_or_odd_request_is_fitted_and_the_caller_is_told_what_applied() {
         let (mut c, size) = fixture();
         let g = c.resize(99999, 99999, Instant::now()).unwrap();
-        assert_eq!((g.width, g.height), (3840, 2160));
-        assert_eq!(caps_geometry(&size), (3840, 2160));
+        assert_eq!(
+            (g.width, g.height),
+            (4096, 4096),
+            "NVENC H.264's own maximum"
+        );
+        assert_eq!(caps_geometry(&size), (4096, 4096));
 
         let (mut c2, size2) = fixture();
         let g2 = c2.resize(1601, 903, Instant::now()).unwrap();
+        assert_eq!((g2.width, g2.height), (1600, 902), "odd sizes drop to even");
+        assert_eq!(caps_geometry(&size2), (1600, 902));
+
+        let (mut c3, _) = fixture();
+        let g3 = c3.resize(100, 40, Instant::now()).unwrap();
         assert_eq!(
-            (g2.width, g2.height),
-            (1600, 896),
-            "rounded down to a multiple of 8"
+            (g3.width, g3.height),
+            (160, 64),
+            "NVENC H.264's own minimum"
         );
-        assert_eq!(caps_geometry(&size2), (1600, 896));
     }
 
     #[test]
@@ -245,7 +264,7 @@ mod tests {
         assert!(format!("{err}").contains("rate-limited"), "got: {err}");
         assert_eq!(
             caps_geometry(&size),
-            (1600, 896),
+            (1600, 900),
             "the refused resize must not apply"
         );
     }
@@ -267,7 +286,7 @@ mod tests {
         let t0 = Instant::now();
         c.resize(1600, 900, t0).unwrap();
         let g = c.resize(1600, 900, t0 + Duration::from_millis(1)).unwrap();
-        assert_eq!((g.width, g.height), (1600, 896));
+        assert_eq!((g.width, g.height), (1600, 900));
     }
 
     // The tests above cover resize/dispatch. These cover the SERVER halves --
@@ -299,7 +318,7 @@ mod tests {
         reader.read_line(&mut reply).unwrap();
         assert_eq!(
             reply.trim(),
-            "OK resize 1600x896",
+            "OK resize 1600x900",
             "the reply must name what APPLIED"
         );
 
@@ -309,7 +328,7 @@ mod tests {
         out.flush().unwrap();
         let mut reply2 = String::new();
         reader.read_line(&mut reply2).unwrap();
-        assert_eq!(reply2.trim(), "OK geometry 1600x896@60");
+        assert_eq!(reply2.trim(), "OK geometry 1600x900@60");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -344,9 +363,9 @@ mod tests {
         gst::init().unwrap();
         let (c, _size) = fixture();
         let ctl = Arc::new(Mutex::new(c));
-        assert_eq!(dispatch("resize 1601 903", &ctl), "OK resize 1600x896");
+        assert_eq!(dispatch("resize 1601 903", &ctl), "OK resize 1600x902");
         assert!(dispatch("resize", &ctl).starts_with("ERR resize needs"));
         assert!(dispatch("wibble", &ctl).starts_with("ERR unknown command"));
-        assert!(dispatch("geometry", &ctl).starts_with("OK geometry 1600x896@"));
+        assert!(dispatch("geometry", &ctl).starts_with("OK geometry 1600x902@"));
     }
 }

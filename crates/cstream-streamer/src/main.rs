@@ -68,6 +68,11 @@ fn main() -> Result<()> {
     std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
 
     let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
+    // Every size the stream takes -- the start and each live resize -- is fitted to the
+    // chosen encoder's own limits, never to a constant.
+    let limits = encoder
+        .limits()
+        .with_context(|| format!("reading the frame-size limits of {}", encoder.label()))?;
     let sink = webrtc::make_sink(&encoder)?;
     // Clone before handing the sink to build_capture, which takes it by value. A gst::Element
     // is a refcounted GObject handle, so this is the SAME element, not a second sink.
@@ -76,6 +81,7 @@ fn main() -> Result<()> {
         &render_node,
         capture_backend.as_ref(),
         Geometry::default(),
+        &limits,
         sink,
         frame_dir.as_deref(),
     )
@@ -187,6 +193,7 @@ fn main() -> Result<()> {
             let ctl = std::sync::Arc::new(std::sync::Mutex::new(Control::new(
                 capture.size.clone(),
                 capture.memory,
+                limits,
                 Geometry::default(),
             )));
             std::thread::spawn(move || control::serve(listener, ctl));

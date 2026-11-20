@@ -14,13 +14,14 @@
 //!
 //! Usage: `cstream-input <action>...` where each action is one of
 //!   `type=<text>`  `key=<keysym>`  `move=<x>,<y>`  `click=<x>,<y>[,<button>]`
-//!   `scroll=<x>,<y>,<dx>,<dy>`
+//!   `scroll=<x>,<y>,<dx>,<dy>` (deltas: 120 per wheel notch, positive = up/left -- GStreamer
+//!   sink convention; the GWD element maps them onto the seat's wheel axis)
 //! Signalling: `CSTREAM_SIGNALLING_URI`, else `ws://127.0.0.1:$CSTREAM_SIGNALLING_PORT`
 //! (default port 8443).
 
 use anyhow::{anyhow, bail, Context, Result};
 use gst::prelude::*;
-use gst_webrtc::{WebRTCDataChannel, WebRTCDataChannelState};
+use gst_webrtc::{WebRTCDataChannel, WebRTCDataChannelState, WebRTCKind, WebRTCRTPTransceiver};
 use serde_json::{json, Value};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -111,6 +112,22 @@ enum Note {
     Channel(WebRTCDataChannel),
     Open,
     Reply(String),
+    Webrtcbin(gst::Element),
+}
+
+/// The negotiated VIDEO stream's mid. Input is addressed to it: with a null mid webrtcsink
+/// pushes the event into every input stream (audio too) and answers "no error" if ANY of
+/// them took it -- measured, the event reached pipewiresrc as well as waylanddisplaysrc --
+/// so the answer would not prove the desktop received anything. Addressed to the video
+/// mid, webrtcsink pushes into the video stream only, and its answer is
+/// waylanddisplaysrc's own verdict on the event.
+fn video_mid(webrtcbin: &gst::Element) -> Option<String> {
+    (0i32..)
+        .map_while(|i| {
+            webrtcbin.emit_by_name::<Option<WebRTCRTPTransceiver>>("get-transceiver", &[&i])
+        })
+        .find(|t| t.property::<WebRTCKind>("kind") == WebRTCKind::Video)
+        .and_then(|t| t.mid().map(|m| m.to_string()))
 }
 
 fn signalling_uri() -> String {
@@ -165,6 +182,7 @@ fn main() -> Result<()> {
         {
             return;
         }
+        let _ = tx.send(Note::Webrtcbin(element.clone()));
         let tx = tx.clone();
         element.connect("on-data-channel", false, move |values| {
             let ch = values[1].get::<WebRTCDataChannel>().ok()?;
@@ -203,6 +221,7 @@ fn drive(pipeline: &gst::Pipeline, rx: &mpsc::Receiver<Note>, events: &[Value]) 
     let deadline = Instant::now() + DEADLINE;
     let bus = pipeline.bus().context("the pipeline has no bus")?;
     let mut channel: Option<WebRTCDataChannel> = None;
+    let mut webrtcbin: Option<gst::Element> = None;
     let mut open = false;
     let mut sent = 0usize;
     let mut answered = std::collections::BTreeSet::new();
@@ -221,8 +240,12 @@ fn drive(pipeline: &gst::Pipeline, rx: &mpsc::Receiver<Note>, events: &[Value]) 
             }
         }
         if let (Some(ch), true, 0) = (channel.as_ref(), open, sent) {
+            let mid = webrtcbin
+                .as_ref()
+                .and_then(video_mid)
+                .ok_or_else(|| anyhow!("the stream negotiated no video transceiver with a mid"))?;
             for (i, ev) in events.iter().enumerate() {
-                let msg = json!({ "id": i + 1, "mid": null, "request": { "type": "navigationEvent", "event": ev } });
+                let msg = json!({ "id": i + 1, "mid": mid, "request": { "type": "navigationEvent", "event": ev } });
                 ch.send_string_full(Some(&msg.to_string()))
                     .with_context(|| format!("sending event {}", i + 1))?;
             }
@@ -243,6 +266,7 @@ fn drive(pipeline: &gst::Pipeline, rx: &mpsc::Receiver<Note>, events: &[Value]) 
         // Bus errors are re-checked at least every 200 ms while waiting.
         match rx.recv_timeout(left.min(Duration::from_millis(200))) {
             Ok(Note::Channel(ch)) => channel = Some(ch),
+            Ok(Note::Webrtcbin(b)) => webrtcbin = Some(b),
             Ok(Note::Open) => open = true,
             Ok(Note::Reply(r)) => {
                 let v: Value =
