@@ -186,10 +186,28 @@ pub fn make_sink(encoder: &Encoder) -> Result<gst::Element> {
 /// nothing -- so an unguarded set would leave the encoder half-tuned and quiet.
 fn tune_encoder(enc: &gst::Element, want: &Encoder) {
     let has = |p: &str| enc.find_property(p).is_some();
+    // The property existing is NOT proof the value is accepted: `set_property_from_str`
+    // panics when the enum has no such nick, and the encoders that carry `tune` do not
+    // share one vocabulary (measured: nvcodec's GstNvH264Enc has `tune` but rejects
+    // `zerolatency`, which panicked the whole streamer — opencharly/charly-streamer#16).
+    // So the nick is checked against the property's own enum class first.
+    let set_enum = |p: &str, nick: &str| -> bool {
+        let Some(spec) = enc.find_property(p) else {
+            return false;
+        };
+        let Some(en) = spec.downcast_ref::<gst::glib::ParamSpecEnum>() else {
+            return false;
+        };
+        if en.enum_class().value_by_nick(nick).is_none() {
+            return false;
+        }
+        enc.set_property_from_str(p, nick);
+        true
+    };
     // A desktop stream is latency-bound, not bitrate-bound: without this the encoder
     // buffers for quality and the cursor lags behind the pointer.
-    if has("tune") && matches!(want, Encoder::Software) {
-        enc.set_property_from_str("tune", "zerolatency");
+    if matches!(want, Encoder::Software) {
+        set_enum("tune", "zerolatency");
     }
     if has("key-int-max") {
         enc.set_property("key-int-max", 60u32);
@@ -197,9 +215,7 @@ fn tune_encoder(enc: &gst::Element, want: &Encoder) {
     if has("bframes") {
         enc.set_property("bframes", 0u32);
     }
-    if has("rate-control") {
-        enc.set_property_from_str("rate-control", "cbr");
-    }
+    set_enum("rate-control", "cbr");
 }
 
 /// Prove a chosen hardware encoder can actually OPEN on this host.

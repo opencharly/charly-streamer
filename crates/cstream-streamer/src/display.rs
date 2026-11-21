@@ -60,7 +60,22 @@ pub fn make_source(render_node: &str, cuda_device: Option<i32>) -> Result<gst::E
 
     // The CUDA path: the source allocates CUDAMemory on this device, the one whose
     // render node it composites on, and NVENC encodes it without a copy.
+    //
+    // Guarded by the property's existence, not assumed: a waylanddisplaysrc built
+    // WITHOUT the cuda feature has no such property, and setting a missing property
+    // on a GObject panics. Measured on an NVIDIA host whose image carried the
+    // non-cuda layer: `panicked at glib/src/object.rs: property 'cuda-device-id' of
+    // type 'GstWaylandDisplaySrc' not found`. A described error is the right answer
+    // there, because the caller asked for a path this image cannot take
+    // (opencharly/charly-streamer#16).
     if let Some(id) = cuda_device {
+        if src.find_property("cuda-device-id").is_none() {
+            bail!(
+                "the waylanddisplaysrc in this image has no `cuda-device-id` property: it was built \
+                 without the cuda feature (layer-gst-wayland-display), so the CUDA backend cannot be \
+                 used. Build that layer with `--features cuda`, or run with a non-CUDA encoder policy"
+            );
+        }
         src.set_property("cuda-device-id", id);
     }
 
