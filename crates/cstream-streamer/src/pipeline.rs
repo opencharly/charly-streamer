@@ -1,14 +1,20 @@
 //! The capture pipeline.
 //!
-//! The graph is `waylanddisplaysrc ! DMABuf caps ! vapostproc ! <encoder>`, and the
-//! DMABuf caps filter is the load-bearing part: it is what forces the zero-copy path.
-//! Without it the source may negotiate system memory and the whole chain silently
-//! becomes a CPU copy that still "works".
+//! The graph follows the render node's encode backend (`rank::Backend`):
+//!
+//! - VA:   `waylanddisplaysrc ! memory:DMABuf caps ! vapostproc ! <sink>`
+//! - CUDA: `waylanddisplaysrc cuda-device-id=N ! memory:CUDAMemory caps ! <sink>`
+//! - none: `waylanddisplaysrc ! system-memory caps ! <sink>` (software encode)
+//!
+//! The memory feature on the caps filter is the load-bearing part: it is what forces
+//! the zero-copy path. Without it the source may negotiate system memory and the
+//! whole chain silently becomes a CPU copy that still "works".
 
 use anyhow::{Context, Result};
 use gst::prelude::*;
 
 use crate::display;
+use crate::rank::Backend;
 
 /// Video geometry for the capture chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,29 +34,115 @@ impl Default for Geometry {
     }
 }
 
+/// The frame sizes the stream can carry: the chosen encoder's OWN limits, read from its
+/// sink pad template. Not a constant: NVENC H.264 takes 160..4096 x 64..4096, NVENC
+/// H.265 144..8192 x 48..8192 (measured with gst-inspect), and a portrait phone window
+/// or a 5K ultrawide is valid for one encoder and not for another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimits {
+    pub width: (u32, u32),
+    pub height: (u32, u32),
+}
+
+impl SizeLimits {
+    /// The union of the width/height ranges across the caps' structures. None when no
+    /// structure bounds both.
+    pub fn from_caps(caps: &gst::CapsRef) -> Option<Self> {
+        fn range(s: &gst::StructureRef, field: &str) -> Option<(u32, u32)> {
+            if let Ok(r) = s.get::<gst::IntRange<i32>>(field) {
+                return Some((r.min().max(1) as u32, r.max().max(1) as u32));
+            }
+            s.get::<i32>(field)
+                .ok()
+                .map(|v| (v.max(1) as u32, v.max(1) as u32))
+        }
+        let mut out: Option<Self> = None;
+        for s in caps.iter() {
+            let (Some(w), Some(h)) = (range(s, "width"), range(s, "height")) else {
+                continue;
+            };
+            out = Some(match out {
+                None => Self {
+                    width: w,
+                    height: h,
+                },
+                Some(o) => Self {
+                    width: (o.width.0.min(w.0), o.width.1.max(w.1)),
+                    height: (o.height.0.min(h.0), o.height.1.max(h.1)),
+                },
+            });
+        }
+        out
+    }
+
+    /// The limits of the element `factory` would create, from its sink pad template.
+    pub fn of_factory(factory: &str) -> Result<Self> {
+        let f = gst::ElementFactory::find(factory)
+            .with_context(|| format!("no {factory} in the GStreamer registry"))?;
+        f.static_pad_templates()
+            .iter()
+            .filter(|t| t.direction() == gst::PadDirection::Sink)
+            .find_map(|t| Self::from_caps(&t.caps()))
+            .with_context(|| format!("{factory}'s sink template bounds no frame size"))
+    }
+}
+
 impl Geometry {
-    /// Clamp and round to what the compositor can actually configure.
-    ///
-    /// Rounding to 8 matters: an odd width reaches the encoder as a size it cannot
-    /// represent, and the failure surfaces far from the resize that caused it.
-    pub fn sanitised(self) -> Self {
-        let w = self.width.clamp(640, 3840) & !7;
-        let h = self.height.clamp(480, 2160) & !7;
+    /// Fit a requested size to what the stream can carry: inside the encoder's own
+    /// limits, and EVEN in both dimensions -- the one constraint 4:2:0 chroma imposes
+    /// (an odd size cannot be subsampled). Nothing else is rounded: H.264 codes sizes
+    /// that are not a multiple of 16 by cropping, so 1366x768 stays 1366x768.
+    pub fn sanitised(self, limits: &SizeLimits) -> Self {
+        let fit = |v: u32, (lo, hi): (u32, u32)| {
+            let lo = lo + (lo & 1); // the smallest EVEN size the encoder takes
+            let hi = (hi & !1).max(lo); // the largest EVEN size the encoder takes
+            (v & !1).clamp(lo, hi)
+        };
         Self {
-            width: w,
-            height: h,
+            width: fit(self.width, limits.width),
+            height: fit(self.height, limits.height),
             framerate: self.framerate.clamp(1, 240),
         }
     }
 
-    /// The DMABuf caps that force the zero-copy path.
-    pub fn dmabuf_caps(&self) -> gst::Caps {
-        gst::Caps::builder("video/x-raw")
-            .features(["memory:DMABuf"])
+    /// The caps that force the zero-copy path for `memory`.
+    pub fn caps(&self, memory: Memory) -> gst::Caps {
+        let b = gst::Caps::builder("video/x-raw")
             .field("width", self.width as i32)
             .field("height", self.height as i32)
-            .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
-            .build()
+            .field("framerate", gst::Fraction::new(self.framerate as i32, 1));
+        match memory.feature() {
+            Some(f) => b.features([f]).build(),
+            None => b.build(),
+        }
+    }
+}
+
+/// Where captured frames live, which decides the caps the source is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Memory {
+    DmaBuf,
+    Cuda,
+    System,
+}
+
+impl Memory {
+    /// The capture memory for an encode backend; `None` (software encode) captures
+    /// to system memory, which every software encoder reads.
+    pub fn for_backend(backend: Option<&Backend>) -> Self {
+        match backend {
+            Some(Backend::Va) => Self::DmaBuf,
+            Some(Backend::Cuda { .. }) => Self::Cuda,
+            None => Self::System,
+        }
+    }
+
+    fn feature(self) -> Option<&'static str> {
+        match self {
+            Self::DmaBuf => Some("memory:DMABuf"),
+            Self::Cuda => Some("memory:CUDAMemory"),
+            Self::System => None,
+        }
     }
 }
 
@@ -60,9 +152,11 @@ pub struct Capture {
     pub source: gst::Element,
     /// The caps filter a resize rewrites. Named `size` so it is findable by name too.
     pub size: gst::Element,
+    /// The memory the caps filter holds the source to; a resize keeps it.
+    pub memory: Memory,
 }
 
-/// Build `waylanddisplaysrc ! DMABuf caps ! vapostproc`, ending at `sink`.
+/// Build the capture graph for `backend`, ending at `sink` (see the module docs).
 ///
 /// `frame_dir`, when set, adds a second branch off a `tee` that writes one JPEG per
 /// second into that directory.
@@ -77,28 +171,47 @@ pub struct Capture {
 /// but no media.
 pub fn build_capture(
     render_node: &str,
+    backend: Option<&Backend>,
     geom: Geometry,
+    limits: &SizeLimits,
     sink: gst::Element,
     frame_dir: Option<&str>,
 ) -> Result<Capture> {
-    let geom = geom.sanitised();
+    let geom = geom.sanitised(limits);
+    let memory = Memory::for_backend(backend);
     let pipeline = gst::Pipeline::new();
-    let source = display::make_source(render_node)?;
+    let cuda_device = match backend {
+        Some(Backend::Cuda { device_id }) => Some(*device_id),
+        _ => None,
+    };
+    let source = display::make_source(render_node, cuda_device)?;
 
     let size = gst::ElementFactory::make("capsfilter")
         .name("size")
-        .property("caps", geom.dmabuf_caps())
+        .property("caps", geom.caps(memory))
         .build()
         .context("creating the size capsfilter")?;
 
-    let convert = gst::ElementFactory::make("vapostproc")
-        .build()
-        .context("creating vapostproc — is gstreamer-vaapi/va installed?")?;
-
     pipeline
-        .add_many([&source, &size, &convert])
+        .add_many([&source, &size])
         .context("adding the capture elements")?;
-    gst::Element::link_many([&source, &size, &convert]).context("linking the capture chain")?;
+    source
+        .link(&size)
+        .context("linking the source to its caps")?;
+
+    // VA needs vapostproc between the DMABuf source and the encoder; CUDA and system
+    // memory feed the sink directly.
+    let convert = if memory == Memory::DmaBuf {
+        let vapostproc = gst::ElementFactory::make("vapostproc")
+            .build()
+            .context("creating vapostproc — is gst-plugin-va installed?")?;
+        pipeline.add(&vapostproc).context("adding vapostproc")?;
+        size.link(&vapostproc)
+            .context("linking the caps to vapostproc")?;
+        vapostproc
+    } else {
+        size.clone()
+    };
 
     match frame_dir {
         None => {
@@ -117,6 +230,16 @@ pub fn build_capture(
             // stutters for a reason that has nothing to do with the stream.
             let q_sink = gst::ElementFactory::make("queue").build()?;
             let q_tap = gst::ElementFactory::make("queue").build()?;
+            // The tap converts on the CPU, so CUDA frames are downloaded first.
+            let download = if memory == Memory::Cuda {
+                Some(
+                    gst::ElementFactory::make("cudadownload")
+                        .build()
+                        .context("creating cudadownload for the frame tap")?,
+                )
+            } else {
+                None
+            };
             let rate = gst::ElementFactory::make("videorate").build()?;
             let rate_caps = gst::ElementFactory::make("capsfilter")
                 .property(
@@ -141,8 +264,13 @@ pub fn build_capture(
                 .context("adding the tee branches")?;
             convert.link(&tee).context("linking convert to the tee")?;
             gst::Element::link_many([&q_sink, &sink]).context("linking the encoder branch")?;
-            gst::Element::link_many([&q_tap, &rate, &rate_caps, &conv2, &enc, &files])
-                .context("linking the frame tap")?;
+            let mut tap: Vec<&gst::Element> = vec![&q_tap];
+            if let Some(d) = download.as_ref() {
+                pipeline.add(d).context("adding cudadownload")?;
+                tap.push(d);
+            }
+            tap.extend([&rate, &rate_caps, &conv2, &enc, &files]);
+            gst::Element::link_many(tap).context("linking the frame tap")?;
             tee.link(&q_sink)
                 .context("linking the tee to the encoder branch")?;
             tee.link(&q_tap)
@@ -154,14 +282,8 @@ pub fn build_capture(
         pipeline,
         source,
         size,
+        memory,
     })
-}
-
-/// Apply a new geometry to a running capture by rewriting the `size` filter.
-pub fn apply_geometry(capture: &Capture, geom: Geometry) -> Geometry {
-    let geom = geom.sanitised();
-    capture.size.set_property("caps", geom.dmabuf_caps());
-    geom
 }
 
 #[cfg(test)]
@@ -188,9 +310,24 @@ mod tap_tests {
             Ok(s) => s,
             Err(_) => return,
         };
+        // Any render node this host has; none means the tap shape is asserted on a
+        // host that does.
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("renderD"))
+            })
+        }) else {
+            return;
+        };
         let cap = match build_capture(
-            "/dev/dri/renderD128",
+            node.to_str().unwrap(),
+            None,
             Geometry::default(),
+            &SizeLimits {
+                width: (16, 8192),
+                height: (16, 8192),
+            },
             sink,
             Some(dir.to_str().unwrap()),
         ) {

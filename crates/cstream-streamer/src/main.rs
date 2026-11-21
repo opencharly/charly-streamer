@@ -10,6 +10,7 @@ use gst::prelude::*;
 
 use cstream_streamer::control::{self, Control};
 use cstream_streamer::pipeline::{build_capture, Geometry};
+use cstream_streamer::rank::Backend;
 use cstream_streamer::webrtc::{self, EncodePolicy};
 
 /// How long to wait for the pipeline to finish its asynchronous state change.
@@ -23,14 +24,27 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    let raised = cstream_streamer::init()?;
+    let render_node = cstream_streamer::display::render_node_from_env()?;
+    let backend = Backend::detect(&render_node, std::path::Path::new("/sys"))
+        .with_context(|| format!("resolving the encode backend of {render_node}"))?;
+    if matches!(backend, Some(Backend::Cuda { .. })) {
+        // Before gst::init: the nvcodec plugin initialises CUDA while the registry
+        // loads, and the ordinal Backend::detect computed is a PCI-bus-order index.
+        std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+    }
+    let raised = cstream_streamer::init(backend.as_ref())?;
 
     let policy = EncodePolicy::parse(&env_or("CSTREAM_ENCODE", "auto"))?;
-    let encoder = webrtc::select_encoder(policy, &webrtc::registry_has)?;
-    let render_node = env_or("CSTREAM_RENDER_NODE", "/dev/dri/renderD128");
+    let encoder = webrtc::select_encoder(policy, backend.as_ref(), &webrtc::registry_has)?;
+    // The capture memory follows the encoder actually chosen: a software encoder reads
+    // system memory, whatever the card could do.
+    let capture_backend = match encoder {
+        webrtc::Encoder::Hardware(_) => backend.clone(),
+        webrtc::Encoder::Software => None,
+    };
 
     eprintln!(
-        "cstream-streamer: promoted={} policy={policy:?} encoder={}",
+        "cstream-streamer: render-node={render_node} backend={backend:?} promoted={} policy={policy:?} encoder={}",
         if raised.is_empty() {
             "none".into()
         } else {
@@ -54,13 +68,20 @@ fn main() -> Result<()> {
     std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
 
     let frame_dir = std::env::var("CSTREAM_FRAME_DIR").ok();
+    // Every size the stream takes -- the start and each live resize -- is fitted to the
+    // chosen encoder's own limits, never to a constant.
+    let limits = encoder
+        .limits()
+        .with_context(|| format!("reading the frame-size limits of {}", encoder.label()))?;
     let sink = webrtc::make_sink(&encoder)?;
     // Clone before handing the sink to build_capture, which takes it by value. A gst::Element
     // is a refcounted GObject handle, so this is the SAME element, not a second sink.
     let audio_sink = sink.clone();
     let capture = build_capture(
         &render_node,
+        capture_backend.as_ref(),
         Geometry::default(),
+        &limits,
         sink,
         frame_dir.as_deref(),
     )
@@ -85,10 +106,10 @@ fn main() -> Result<()> {
     match cstream_streamer::lifecycle::LockPolicy::from_env() {
         Some(policy) => {
             let secs = policy.after.as_secs();
-            cstream_streamer::lifecycle::arm(&audio_sink, policy, runtime_dir.clone());
+            cstream_streamer::lifecycle::arm(&audio_sink, policy);
             println!(
                 "lock: {} after {secs}s with no viewer",
-                cstream_streamer::lifecycle::LOCK_COMMAND
+                cstream_streamer::lifecycle::LOCK_METHOD
             );
         }
         None => println!("lock: off (set CSTREAM_LOCK_AFTER=<seconds> to arm)"),
@@ -147,6 +168,12 @@ fn main() -> Result<()> {
     // unusable render node -- exactly the case `encode: va` exists to catch.
     webrtc::verify_openable(&encoder)?;
     println!("CSTREAM-ENCODER-OPENABLE encoder={}", encoder.label());
+    // Published for the gateway's /healthz (and so `cstream: status`): the encoder
+    // reported is the one that just OPENED, not one the gateway infers.
+    if !probe {
+        cstream_streamer::status::publish(&runtime_dir, &encoder.label())
+            .context("publishing the streamer status for the gateway")?;
+    }
 
     if probe {
         capture.pipeline.set_state(gst::State::Null).ok();
@@ -165,6 +192,8 @@ fn main() -> Result<()> {
         Ok(listener) => {
             let ctl = std::sync::Arc::new(std::sync::Mutex::new(Control::new(
                 capture.size.clone(),
+                capture.memory,
+                limits,
                 Geometry::default(),
             )));
             std::thread::spawn(move || control::serve(listener, ctl));
