@@ -30,6 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-base pkg-config \
             libpam0g-dev libclang-dev
 
@@ -47,6 +48,17 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      - name: Player unit tests (node --test)
+        # The TEST FILES are named explicitly, not their directory: `node --test <dir>`
+        # resolves a directory only on newer Node releases, and this job pins none, so the
+        # same step passed locally (v26) and failed on the runner ("Cannot find module
+        # '.../cmd/cstream-gateway/web'"). The shell glob works on every version, and the
+        # `test -e` line makes a missing file a failure instead of a silent no-op.
+        run: |
+          set -e
+          for f in cmd/cstream-gateway/web/*.test.js; do test -e "$f"; done
+          node --test cmd/cstream-gateway/web/*.test.js
 
       - name: Go build and test (CGO_ENABLED=0)
         run: |

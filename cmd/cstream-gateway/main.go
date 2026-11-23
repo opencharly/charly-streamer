@@ -1,115 +1,60 @@
 // cstream-gateway serves the browser-facing surface of a cstream desktop.
 //
-// It is deliberately dependency-free and CGO_ENABLED=0: it is the one component
-// exposed to the network, so its build should be reproducible and its attack
-// surface small.
+// It is the ONE component exposed to the network, so it stays dependency-free and
+// CGO_ENABLED=0 (a reproducible build, a small attack surface), and it is the only
+// path to the stream: the streamer's signalling server listens on loopback, and the
+// gateway proxies it to authenticated browsers only.
+//
+// Routes:
+//
+//	GET  /            the player (login form, <video>, input capture)
+//	GET  /healthz     readiness, the active encoder and the viewer count (JSON)
+//	GET  /session     200 + the user when the session cookie is valid, 401 otherwise
+//	POST /login       PAM authentication through cstream-leader; sets the session cookie
+//	POST /logout      drops the session
+//	GET  /signalling  the WebRTC signalling WebSocket, proxied to the streamer (auth required)
 package main
 
 import (
-	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 )
 
-// Status is what /healthz and the page report. It is deliberately a struct rather
-// than an ad-hoc map so the shape is checkable from a test and from a cdp: probe.
-type Status struct {
-	Service    string `json:"service"`
-	Ready      bool   `json:"ready"`
-	RenderNode string `json:"render_node"`
-	Display    string `json:"display"`
-}
-
-// probeStatus reports what the gateway can actually observe, not what it hopes.
-//
-// Ready means the two things a browser client genuinely depends on: a DRM render
-// node exists (there is no software fallback that can host a nested compositor)
-// and the compositor has published a Wayland socket. Reporting ready without
-// those would let a page load and then stream nothing.
-func probeStatus(renderNode, runtimeDir, display string) Status {
-	s := Status{Service: "cstream-gateway", RenderNode: renderNode, Display: display}
-	if renderNode == "" || display == "" {
-		return s
-	}
-	if _, err := os.Stat(renderNode); err != nil {
-		return s
-	}
-	if _, err := os.Stat(filepath.Join(runtimeDir, display)); err != nil {
-		return s
-	}
-	s.Ready = true
-	return s
-}
-
-// page renders the browser surface. The marker is what a cdp: text probe asserts;
-// it is only emitted when the stack is genuinely ready, so a CDP check cannot pass
-// against a half-started pod.
-func page(s Status) string {
-	state := "NOT-READY"
-	if s.Ready {
-		state = "CSTREAM-READY"
-	}
-	// The input targets below exist so an input probe can be NON-VACUOUS. A click
-	// or a keystroke that lands on an inert page cannot be distinguished from one
-	// that was silently dropped -- both "succeed". These elements record what
-	// actually arrived, so a CDP probe can assert the effect rather than the
-	// absence of an error.
-	return fmt.Sprintf(`<!doctype html>
-<title>cstream</title>
-<h1>cstream</h1>
-<p id="state">%s</p>
-<p id="render-node">%s</p>
-<p id="display">%s</p>
-
-<button id="probe-button" onclick="document.getElementById('click-result').textContent='CLICK-RECEIVED'">probe</button>
-<p id="click-result">no-click</p>
-
-<input id="probe-input" oninput="document.getElementById('type-result').textContent='TYPED:'+this.value">
-<p id="type-result">no-input</p>
-
-<p id="key-result">no-key</p>
-<script>
-document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') {
-    document.getElementById('key-result').textContent = 'KEY-RECEIVED:Escape';
-  }
-});
-</script>
-`, state, s.RenderNode, s.Display)
-}
-
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	renderNode := flag.String("render-node", envOr("CSTREAM_RENDER_NODE", "/dev/dri/renderD128"), "DRM render node")
+	// The streamer's rule: CSTREAM_RENDER_NODE when the deployment names one, else
+	// charly's injected DRINODE. No literal default -- an unset node reports not-ready.
+	renderNode := flag.String("render-node", envOr("CSTREAM_RENDER_NODE", os.Getenv("DRINODE")), "DRM render node (CSTREAM_RENDER_NODE, else DRINODE)")
 	runtimeDir := flag.String("runtime-dir", envOr("XDG_RUNTIME_DIR", "/tmp/cstream-rt"), "XDG runtime dir")
 	display := flag.String("display", envOr("WAYLAND_DISPLAY", "wayland-1"), "wayland display")
+	signalling := flag.String("signalling", envOr("CSTREAM_SIGNALLING_UPSTREAM", "http://127.0.0.1:8443"), "the streamer's loopback signalling server")
+	leader := flag.String("leader", envOr("CSTREAM_LEADER", "/usr/local/bin/cstream-leader"), "the PAM session leader binary")
+	pamService := flag.String("pam-service", envOr("CSTREAM_PAM_SERVICE", "cstream"), "the PAM service the leader authenticates against")
 	flag.Parse()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		s := probeStatus(*renderNode, *runtimeDir, *display)
-		w.Header().Set("Content-Type", "application/json")
-		if !s.Ready {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		_ = json.NewEncoder(w).Encode(s)
+	g, err := newGateway(gatewayConfig{
+		RenderNode: *renderNode,
+		RuntimeDir: *runtimeDir,
+		Display:    *display,
+		Signalling: *signalling,
+		Leader:     *leader,
+		PAMService: *pamService,
+		SessionTTL: 12 * time.Hour,
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(page(probeStatus(*renderNode, *runtimeDir, *display))))
-	})
+	if err != nil {
+		log.Fatalf("cstream-gateway: %v", err)
+	}
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           g.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("cstream-gateway listening on %s (render-node=%s display=%s)", *addr, *renderNode, *display)
+	log.Printf("cstream-gateway listening on %s (render-node=%s display=%s signalling=%s)",
+		*addr, *renderNode, *display, *signalling)
 	log.Fatal(srv.ListenAndServe())
 }
 
