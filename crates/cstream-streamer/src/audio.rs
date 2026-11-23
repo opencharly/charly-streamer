@@ -67,7 +67,7 @@ impl AudioConfig {
     ///     and the bed check on the monitor link;
     ///   * but a failure to attach aborts the process, and **this process is the Wayland
     ///     parent**. Measured on `check-cstream-pod`: with audio on by default and the audio
-    ///     path unavailable, `cstream-parent` went FATAL, `cstream-hyprland` restart-looped
+    ///     path unavailable, `cstream-parent` went FATAL, the nested compositor restart-looped
     ///     with no parent display, and the consumer-side frame probe hung for 11 minutes on
     ///     media that would never arrive. An optional feature took down the product.
     ///

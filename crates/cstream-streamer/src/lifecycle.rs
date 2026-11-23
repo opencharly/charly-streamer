@@ -2,26 +2,20 @@
 //!
 //! A streamed desktop has no lid to close and no seat to lock from. When the last WebRTC
 //! consumer disconnects, the session is still logged in and still rendering — anyone who
-//! reconnects lands straight in it. This arms `hyprlock` after a configured idle period.
+//! reconnects lands straight in it. This locks it after a configured idle period.
 //!
-//! ## Three things here were measured on a live pod, not assumed
+//! ## The lock is the desktop's own, asked for over D-Bus
 //!
-//! **The streamer cannot simply spawn `hyprlock`.** It is the Wayland *parent*; Hyprland
-//! nests inside it on a different display. A lock spawned from this process would attach to
-//! the wrong compositor. It has to be dispatched *into* Hyprland over its IPC socket.
+//! The streamer is the Wayland *parent*; the desktop nests inside it on a different
+//! display, so a locker spawned from this process would attach to the wrong compositor.
+//! The lock is therefore REQUESTED from the desktop, through the freedesktop screensaver
+//! interface (`org.freedesktop.ScreenSaver.Lock` on the session bus). KDE Plasma's
+//! kscreenlocker implements it, as do the other desktops that ship a locker, so the
+//! streamer names no compositor at all. `DBUS_SESSION_BUS_ADDRESS` in this process's
+//! environment selects the desktop's bus.
 //!
-//! **The socket is discoverable, and it is under our own runtime dir.** Hyprland puts it at
-//! `$XDG_RUNTIME_DIR/hypr/<instance-signature>/.socket.sock`, and this process owns that
-//! `XDG_RUNTIME_DIR`, so the signature can be read off the directory listing. It is NOT in
-//! Hyprland's `/proc/<pid>/environ`, so an env probe finds nothing — the same trap
-//! `plugin-wl` documents.
-//!
-//! **The dispatcher is `exec_raw`, not `exec`.** Hyprland >= 0.55 replaced string dispatchers
-//! with Lua, and `hl.dsp.exec` does not exist — dispatching it answers
-//! `attempt to call a nil value (field 'exec')`, while the legacy `exec hyprlock` form is a
-//! Lua syntax error. Enumerated live, the namespace offers `exec_cmd` and `exec_raw`; both
-//! launch it, and `exec_raw` is used here because the command is a fixed binary with no
-//! arguments and raw exec avoids any shell interpretation of the string.
+//! The call goes through `gdbus` with a bounded `--timeout`: a desktop whose locker
+//! is wedged fails the call instead of hanging the lock thread.
 //!
 //! ## Failures are non-fatal, deliberately
 //!
@@ -30,14 +24,55 @@
 //! anybody is still watching. That is the same proportionality that made the audio branch
 //! opt-in after it killed the parent on a pod where its path was unavailable.
 
-use anyhow::{anyhow, Context, Result};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use anyhow::{bail, Context, Result};
 use std::time::Duration;
 
-/// The lock command dispatched into Hyprland.
-pub const LOCK_COMMAND: &str = "hyprlock";
+/// The freedesktop screensaver service the desktop's locker owns.
+pub const LOCK_DEST: &str = "org.freedesktop.ScreenSaver";
+/// Its object path.
+pub const LOCK_PATH: &str = "/ScreenSaver";
+/// The method that locks the session.
+pub const LOCK_METHOD: &str = "org.freedesktop.ScreenSaver.Lock";
+/// How long the desktop may take to answer, in seconds (gdbus `--timeout`).
+pub const LOCK_TIMEOUT_SECS: u32 = 5;
+
+/// The argv of the lock request.
+pub fn lock_argv() -> Vec<String> {
+    [
+        "gdbus",
+        "call",
+        "--session",
+        "--timeout",
+        &LOCK_TIMEOUT_SECS.to_string(),
+        "--dest",
+        LOCK_DEST,
+        "--object-path",
+        LOCK_PATH,
+        "--method",
+        LOCK_METHOD,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Ask the desktop to lock. `Ok` only when the desktop ANSWERED the call: a missing
+/// locker answers `ServiceUnknown`, which is a failure to report, not a lock.
+pub fn lock_desktop() -> Result<()> {
+    let argv = lock_argv();
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .context("running gdbus")?;
+    if !out.status.success() {
+        bail!(
+            "{LOCK_METHOD} refused ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
 
 /// When to lock after the last consumer leaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,68 +108,6 @@ impl LockPolicy {
             }
         }
     }
-}
-
-/// Hyprland's IPC socket, located under the runtime dir this process owns.
-#[derive(Debug, Clone)]
-pub struct HyprIpc {
-    pub socket: PathBuf,
-}
-
-impl HyprIpc {
-    /// Find `<runtime_dir>/hypr/<signature>/.socket.sock`.
-    ///
-    /// The signature is a per-instance directory name; there is normally exactly one. If
-    /// several exist the newest is taken, because a stale directory from a crashed instance
-    /// outlives it and silently addressing the dead one is worse than picking wrong.
-    pub fn discover(runtime_dir: &str) -> Result<Self> {
-        let base = Path::new(runtime_dir).join("hypr");
-        let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&base)
-            .with_context(|| format!("reading {} — is Hyprland running?", base.display()))?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let sock = e.path().join(".socket.sock");
-                if !sock.exists() {
-                    return None;
-                }
-                let t = e.metadata().and_then(|m| m.modified()).ok()?;
-                Some((t, sock))
-            })
-            .collect();
-        candidates.sort_by_key(|(t, _)| *t);
-        let socket = candidates
-            .pop()
-            .map(|(_, p)| p)
-            .ok_or_else(|| anyhow!("no .socket.sock under {}", base.display()))?;
-        Ok(Self { socket })
-    }
-
-    /// Send one command and return Hyprland's reply.
-    pub fn send(&self, command: &str) -> Result<String> {
-        let mut s = UnixStream::connect(&self.socket)
-            .with_context(|| format!("connecting to {}", self.socket.display()))?;
-        s.set_read_timeout(Some(Duration::from_secs(5)))?;
-        s.write_all(command.as_bytes())
-            .context("writing the IPC command")?;
-        let mut reply = String::new();
-        s.read_to_string(&mut reply).context("reading the reply")?;
-        Ok(reply)
-    }
-
-    /// Dispatch the lock. Returns the reply so a caller can tell `ok` from a Lua error.
-    ///
-    /// Hyprland answers `ok` for a dispatch it accepted and an `error: …` string otherwise —
-    /// including for a dispatcher that does not exist, which is why the caller checks the
-    /// reply rather than treating a successful write as success.
-    pub fn lock(&self, command: &str) -> Result<String> {
-        self.send(&format!(r#"dispatch hl.dsp.exec_raw("{command}")"#))
-    }
-}
-
-/// Whether a reply from [`HyprIpc::lock`] actually means it ran.
-pub fn dispatch_accepted(reply: &str) -> bool {
-    let r = reply.trim();
-    !r.is_empty() && !r.starts_with("error") && !r.contains("nil value")
 }
 
 /// When to lock, as a pure state machine over consumer arrivals and departures.
@@ -186,7 +159,7 @@ impl LockTracker {
 ///
 /// Every failure path logs and returns: see the module docs on why nothing here may abort
 /// the process.
-pub fn arm(sink: &gst::Element, policy: LockPolicy, runtime_dir: String) {
+pub fn arm(sink: &gst::Element, policy: LockPolicy) {
     use gst::prelude::*;
     use std::sync::{Arc, Mutex};
 
@@ -217,18 +190,9 @@ pub fn arm(sink: &gst::Element, policy: LockPolicy, runtime_dir: String) {
         if !fire {
             continue;
         }
-        // Discovered per lock rather than once at startup: Hyprland can restart under us,
-        // and a signature cached from a dead instance would send every future lock into a
-        // socket nobody is listening on.
-        match HyprIpc::discover(&runtime_dir) {
-            Err(e) => eprintln!("lock: cannot reach Hyprland: {e:#}"),
-            Ok(ipc) => match ipc.lock(LOCK_COMMAND) {
-                Err(e) => eprintln!("lock: dispatch failed: {e:#}"),
-                Ok(reply) if !dispatch_accepted(&reply) => {
-                    eprintln!("lock: Hyprland REFUSED the dispatch: {}", reply.trim())
-                }
-                Ok(_) => eprintln!("lock: {LOCK_COMMAND} dispatched after idle"),
-            },
+        match lock_desktop() {
+            Err(e) => eprintln!("lock: {e:#}"),
+            Ok(()) => eprintln!("lock: {LOCK_METHOD} requested after idle"),
         }
     });
 }
@@ -236,14 +200,6 @@ pub fn arm(sink: &gst::Element, policy: LockPolicy, runtime_dir: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("cstream-lifecycle-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
 
     fn with_env<T>(val: Option<&str>, f: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -271,46 +227,20 @@ mod tests {
         assert_eq!(p.after, Duration::from_secs(300));
     }
 
+    /// The request names the freedesktop interface and a bounded timeout; no
+    /// compositor appears in it.
     #[test]
-    fn the_dispatch_names_exec_raw_not_exec() {
-        // Measured on a live pod: `hl.dsp.exec` is nil and answers
-        // `attempt to call a nil value (field 'exec')`; the namespace offers exec_cmd and
-        // exec_raw. Pinning the spelling here because the failure is a runtime Lua error,
-        // which no amount of compiling catches.
-        let ipc = HyprIpc {
-            socket: PathBuf::from("/nonexistent"),
-        };
-        let cmd = format!(r#"dispatch hl.dsp.exec_raw("{LOCK_COMMAND}")"#);
-        assert!(cmd.contains("exec_raw"));
-        assert!(!cmd.contains("dsp.exec("));
-        // and the command actually sent is built the same way
-        assert!(ipc.lock(LOCK_COMMAND).is_err(), "no socket at that path");
-    }
-
-    #[test]
-    fn discover_finds_the_socket_under_the_runtime_dir() {
-        let rt = tmpdir("discover");
-        let sig = rt.join("hypr").join("abc123_1_2");
-        std::fs::create_dir_all(&sig).unwrap();
-        std::fs::write(sig.join(".socket.sock"), b"").unwrap();
-        let ipc = HyprIpc::discover(rt.to_str().unwrap()).expect("should find the socket");
-        assert_eq!(ipc.socket, sig.join(".socket.sock"));
-    }
-
-    #[test]
-    fn discover_ignores_an_instance_dir_with_no_socket() {
-        // A crashed instance leaves the directory behind. Addressing it silently would send
-        // every lock into a socket nobody is listening on.
-        let rt = tmpdir("stale");
-        std::fs::create_dir_all(rt.join("hypr").join("dead_instance")).unwrap();
-        assert!(HyprIpc::discover(rt.to_str().unwrap()).is_err());
-    }
-
-    #[test]
-    fn discover_reports_a_missing_hypr_dir_rather_than_panicking() {
-        let rt = tmpdir("empty");
-        let e = HyprIpc::discover(rt.to_str().unwrap()).unwrap_err();
-        assert!(format!("{e:#}").contains("is Hyprland running?"));
+    fn the_lock_is_the_freedesktop_screensaver_call() {
+        let argv = lock_argv();
+        assert_eq!(argv[0], "gdbus");
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--dest" && w[1] == LOCK_DEST));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--method" && w[1] == LOCK_METHOD));
+        assert!(argv.windows(2).any(|w| w[0] == "--timeout" && w[1] == "5"));
+        assert!(argv.contains(&"--session".to_string()));
     }
 
     #[test]
@@ -372,16 +302,5 @@ mod tests {
         let mut k = LockTracker::default();
         k.on_consumer_removed(std::time::Instant::now());
         assert_eq!(k.consumers, 0);
-    }
-
-    #[test]
-    fn a_lua_error_reply_is_not_treated_as_success() {
-        // The exact string a wrong dispatcher produced on the live pod.
-        assert!(!dispatch_accepted(
-            r#"error: [string "return hl.dispatch(hl.dsp.exec("hyprlock"))"]:1: attempt to call a nil value (field 'exec')"#
-        ));
-        assert!(!dispatch_accepted(""));
-        assert!(!dispatch_accepted("   "));
-        assert!(dispatch_accepted("ok"));
     }
 }

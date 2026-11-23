@@ -1,4 +1,7 @@
 # Rust build artifacts (committed once in feat/gateway — removed 2026-08-29)
 /target/
-# Compiled gateway binary (built from cmd/cstream-gateway)
+# Compiled gateway binaries — by PATH, not by name: `**/cstream-gateway` also matches the
+# SOURCE directory `cmd/cstream-gateway/`, which silently ignores any new file added there
+# (review of #24, Block 3). The two build outputs are these, and only these.
 /cstream-gateway
+/cmd/cstream-gateway/cstream-gateway
