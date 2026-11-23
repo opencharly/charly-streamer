@@ -192,3 +192,31 @@ func TestSessionsExpire(t *testing.T) {
 		t.Fatal("an expired session must be deleted, not kept")
 	}
 }
+
+// An abandoned browser never calls lookup again, so lookup's on-sight deletion cannot
+// reclaim its entry: the store must purge expired sessions on the path that grows it
+// (review of #24, Block 2). Without the purge in create, this test fails with three
+// lingering entries.
+func TestCreatePurgesExpiredSessions(t *testing.T) {
+	s := newSessionStore(time.Minute)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	for i := 0; i < 3; i++ {
+		if _, err := s.create("probe"); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	// Every one of them expires without ever being looked up again.
+	now = now.Add(2 * time.Minute)
+	if _, err := s.create("probe"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	s.mu.Lock()
+	got := len(s.m)
+	s.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("after the expired ones were abandoned and a new session created, the store holds %d sessions, want 1", got)
+	}
+}

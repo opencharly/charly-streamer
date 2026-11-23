@@ -42,7 +42,7 @@ func main() {
 		Signalling: *signalling,
 		Leader:     *leader,
 		PAMService: *pamService,
-		SessionTTL: 12 * time.Hour,
+		SessionTTL: sessionTTL(),
 	})
 	if err != nil {
 		log.Fatalf("cstream-gateway: %v", err)
@@ -56,6 +56,18 @@ func main() {
 	log.Printf("cstream-gateway listening on %s (render-node=%s display=%s signalling=%s)",
 		*addr, *renderNode, *display, *signalling)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// sessionTTL is the login lifetime: CSTREAM_SESSION_TTL, defaulting to 12h. A named,
+// config-sourced value rather than a literal in the config struct (R3), and a malformed
+// value is fatal rather than silently replaced by the default.
+func sessionTTL() time.Duration {
+	raw := envOr("CSTREAM_SESSION_TTL", "12h")
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		log.Fatalf("cstream-gateway: CSTREAM_SESSION_TTL=%q is not a positive duration", raw)
+	}
+	return d
 }
 
 func envOr(k, def string) string {

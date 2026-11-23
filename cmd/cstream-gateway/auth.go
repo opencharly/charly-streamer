@@ -54,13 +54,28 @@ func (s *sessionStore) create(user string) (string, error) {
 	tok := hex.EncodeToString(b)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Purge on the only path that GROWS the map. lookup's on-sight deletion cannot
+	// reclaim an abandoned browser (it never calls again), so without this the map
+	// grows by one entry per login that is never logged out or re-looked-up.
+	s.purgeExpiredLocked()
 	s.m[tok] = session{user: user, expires: s.now().Add(s.ttl)}
 	return tok, nil
 }
 
+// purgeExpiredLocked drops every expired session. Callers must hold s.mu.
+func (s *sessionStore) purgeExpiredLocked() {
+	now := s.now()
+	for tok, ss := range s.m {
+		if !now.Before(ss.expires) {
+			delete(s.m, tok)
+		}
+	}
+}
+
 // lookup returns the session's user, or "" when the token is unknown or expired.
-// An expired session is deleted on sight, so the map cannot grow without bound
-// from abandoned browsers.
+// An expired token is deleted on sight. That alone does NOT bound the map: an
+// abandoned browser never comes back, so create purges expired entries on every
+// insert, which is the only place the map grows.
 func (s *sessionStore) lookup(tok string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
