@@ -150,3 +150,42 @@ func TestSignallingProxiesAnAuthenticatedUpgradeAndCountsTheViewer(t *testing.T)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestSignallingRequestsCountsEveryArrival is the instrument for
+// opencharly/charly-streamer#22: a probe must be able to tell "the browser's socket never
+// reached the gateway" (the counter stays 0) from "a socket arrived and the session count
+// is wrong" (the counter rises while viewers does not). A REFUSED request is the sharpest
+// case: it reaches the handler, so the arrival counter moves, but it must never count as a
+// viewer.
+func TestSignallingRequestsCountsEveryArrival(t *testing.T) {
+	up := newEchoUpgradeServer(t)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	gw := httptest.NewServer(g.routes())
+	defer gw.Close()
+
+	conn, _, code := dialSignalling(t, gw, nil, "")
+	conn.Close()
+	if code != http.StatusUnauthorized {
+		t.Fatalf("anonymous /signalling = %d, want 401", code)
+	}
+	if got := g.signallingRequests.Load(); got != 1 {
+		t.Fatalf("signalling requests after one refused arrival = %d, want 1 — the probe could not tell 'no socket' from 'not counted'", got)
+	}
+	if got := g.viewers.Load(); got != 0 {
+		t.Fatalf("viewers after a REFUSED request = %d, want 0", got)
+	}
+
+	u, _ := url.Parse(gw.URL)
+	conn2, _, code := dialSignalling(t, gw, loggedInCookie(t, g), "http://"+u.Host)
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("authenticated /signalling = %d, want 101", code)
+	}
+	if got := g.signallingRequests.Load(); got != 2 {
+		t.Fatalf("signalling requests after an accepted arrival = %d, want 2", got)
+	}
+	if got := g.viewers.Load(); got != 1 {
+		t.Fatalf("viewers during the session = %d, want 1", got)
+	}
+	conn2.Close()
+}

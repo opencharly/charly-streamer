@@ -29,6 +29,7 @@ func newSignallingProxy(upstream *url.URL) *httputil.ReverseProxy {
 // requests; the Origin check is the second lock, because a WebSocket is not
 // subject to CORS and a browser will open one to any host.
 func (g *gateway) handleSignalling(w http.ResponseWriter, r *http.Request) {
+	g.signallingRequests.Add(1)
 	if g.sessionUser(r) == "" {
 		http.Error(w, "login required", http.StatusUnauthorized)
 		return

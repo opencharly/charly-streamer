@@ -37,6 +37,12 @@ type gateway struct {
 	sessions *sessionStore
 	proxy    *httputil.ReverseProxy
 	viewers  atomic.Int64
+	// signallingRequests counts every request that REACHED handleSignalling, before the
+	// session check. It exists to tell two failures apart that look identical from outside:
+	// "the browser's socket never reaches the gateway" (requests stays 0) and "the socket is
+	// served but the session count is wrong" (requests rises, viewers does not) —
+	// opencharly/charly-streamer#22.
+	signallingRequests atomic.Int64
 }
 
 func newGateway(cfg gatewayConfig) (*gateway, error) {
@@ -77,6 +83,9 @@ type Status struct {
 	Encoder string `json:"encoder"`
 	// Viewers is the number of browsers currently holding a signalling session.
 	Viewers int64 `json:"viewers"`
+	// SignallingRequests counts requests that reached /signalling (refused ones included),
+	// so a probe can tell "no socket arrived" from "a socket arrived and did not count".
+	SignallingRequests int64 `json:"signalling_requests"`
 }
 
 // probeStatus reports what the gateway can actually observe, not what it hopes.
@@ -121,6 +130,7 @@ func readStreamerEncoder(runtimeDir string) string {
 func (g *gateway) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	s := probeStatus(g.cfg.RenderNode, g.cfg.RuntimeDir, g.cfg.Display)
 	s.Viewers = g.viewers.Load()
+	s.SignallingRequests = g.signallingRequests.Load()
 	w.Header().Set("Content-Type", "application/json")
 	if !s.Ready {
 		w.WriteHeader(http.StatusServiceUnavailable)
